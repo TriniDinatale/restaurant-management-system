@@ -1,5 +1,6 @@
 
 from decimal import Decimal
+from types import SimpleNamespace
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
@@ -683,4 +684,185 @@ class CuentaModelTests(TestCase):
             ).count(),
             2,
         )
+
+
+class CuentaAPITests(APITestCase):
+    def setUp(self):
+        self.salon = Sector.objects.create(
+            nombre=Sector.Nombre.SALON,
+        )
+        self.barra = Sector.objects.create(
+            nombre=Sector.Nombre.BARRA,
+        )
+        self.pizza = Sector.objects.create(
+            nombre=Sector.Nombre.PIZZA,
+        )
+
+        self.mozo = User.objects.create_user(
+            username="mozo_cuenta_api",
+            password="test-password-123",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.admin = User.objects.create_user(
+            username="admin_cuenta_api",
+            password="test-password-123",
+            rol=User.Rol.ADMINISTRADOR,
+        )
+        self.usuario_barra = User.objects.create_user(
+            username="barra_cuenta_api",
+            password="test-password-123",
+            rol=User.Rol.BARRA,
+            sector=self.barra,
+        )
+        self.cocina = User.objects.create_user(
+            username="cocina_cuenta_api",
+            password="test-password-123",
+            rol=User.Rol.COCINA,
+            sector=self.pizza,
+        )
+
+        self.mesa = Mesa.objects.create(numero=20)
+        self.url = reverse("cuenta-create")
+        self.datos = {"mesa": self.mesa.pk}
+
+    def test_waiter_can_open_account(self):
+        self.client.force_authenticate(user=self.mozo)
+
+        response = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Cuenta.objects.count(), 1)
+        self.assertEqual(Cuenta.objects.get().mesa, self.mesa)
+
+    def test_non_waiter_roles_cannot_open_account(self):
+        for usuario in [self.admin, self.usuario_barra, self.cocina]:
+            with self.subTest(rol=usuario.rol):
+                self.client.force_authenticate(user=usuario)
+
+                response = self.client.post(
+                    self.url,
+                    self.datos,
+                    format="json",
+                )
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+        self.assertEqual(Cuenta.objects.count(), 0)
+
+    def test_anonymous_user_cannot_open_account(self):
+        response = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+
+        self.assertIn(
+            response.status_code,
+            {
+                status.HTTP_401_UNAUTHORIZED,
+                status.HTTP_403_FORBIDDEN,
+            },
+        )
+        self.assertEqual(Cuenta.objects.count(), 0)
+
+    def test_open_account_cannot_be_duplicated_for_same_table(self):
+        self.client.force_authenticate(user=self.mozo)
+
+        primera_respuesta = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+        segunda_respuesta = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+
+        self.assertEqual(
+            primera_respuesta.status_code,
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(
+            segunda_respuesta.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn("mesa", segunda_respuesta.data)
+        self.assertEqual(Cuenta.objects.count(), 1)
+
+    def test_new_account_is_open(self):
+        self.client.force_authenticate(user=self.mozo)
+
+        response = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["estado"], Cuenta.Estado.ABIERTA)
+
+    def test_account_can_be_reopened_after_closing(self):
+        self.client.force_authenticate(user=self.mozo)
+
+        primera_respuesta = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+        primera_cuenta = Cuenta.objects.get(pk=primera_respuesta.data["id"])
+        primera_cuenta.cerrar()
+
+        segunda_respuesta = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+
+        self.assertEqual(
+            segunda_respuesta.status_code,
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(Cuenta.objects.count(), 2)
+        self.assertEqual(
+            Cuenta.objects.filter(
+                mesa=self.mesa,
+                estado=Cuenta.Estado.ABIERTA,
+            ).count(),
+            1,
+        )
+
+    def test_unique_constraint_collision_returns_validation_error(self):
+        self.client.force_authenticate(user=self.mozo)
+        driver_error = Exception("duplicate key")
+        driver_error.diag = SimpleNamespace(
+            constraint_name="unique_cuenta_abierta_por_mesa",
+        )
+        integrity_error = IntegrityError("duplicate key")
+        integrity_error.__cause__ = driver_error
+
+        with patch(
+            "pedidos.serializers.Cuenta.objects.create",
+            side_effect=integrity_error,
+        ):
+            response = self.client.post(
+                self.url,
+                self.datos,
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn("mesa", response.data)
+        self.assertEqual(Cuenta.objects.count(), 0)
 

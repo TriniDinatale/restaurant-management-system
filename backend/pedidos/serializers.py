@@ -1,5 +1,5 @@
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from productos.models import Producto
@@ -138,6 +138,23 @@ class CuentaSerializer(serializers.ModelSerializer):
             )
 
         return mesa
+
+    def create(self, validated_data):
+        try:
+            with transaction.atomic():
+                return super().create(validated_data)
+        except IntegrityError as exc:
+            constraint_name = getattr(
+                getattr(exc.__cause__, "diag", None),
+                "constraint_name",
+                None,
+            )
+            if constraint_name != "unique_cuenta_abierta_por_mesa":
+                raise
+
+            raise serializers.ValidationError(
+                {"mesa": "Esta mesa ya tiene una cuenta abierta."}
+            ) from exc
 
 
 class DetallePedidoLecturaSerializer(serializers.ModelSerializer):
