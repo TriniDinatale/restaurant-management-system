@@ -91,8 +91,6 @@ class Pedido(models.Model):
         Cuenta,
         on_delete=models.PROTECT,
         related_name="pedidos",
-        null=True,
-        blank=True,
     )
 
 

@@ -59,6 +59,7 @@ class PedidoModelTests(TestCase):
         self.pedido = Pedido.objects.create(
             mesa=self.mesa,
             mozo=self.mozo,
+            cuenta=self.cuenta,
         )
 
     def test_mesa_has_unique_number(self):
@@ -71,6 +72,7 @@ class PedidoModelTests(TestCase):
         pedido = Pedido(
             mesa=self.mesa,
             mozo=self.cocina,
+            cuenta=self.cuenta,
         )
 
         with self.assertRaises(ValidationError):
@@ -81,6 +83,15 @@ class PedidoModelTests(TestCase):
             self.pedido.mozo,
             self.mozo,
         )
+
+    def test_pedido_requires_account(self):
+        pedido = Pedido(
+            mesa=self.mesa,
+            mozo=self.mozo,
+        )
+
+        with self.assertRaises(ValidationError):
+            pedido.save()
 
     def test_detalle_copies_product_price(self):
         detalle = DetallePedido.objects.create(
@@ -373,6 +384,24 @@ class PedidoAPITests(APITestCase):
             status.HTTP_400_BAD_REQUEST,
         )
 
+        self.assertEqual(Pedido.objects.count(), 0)
+
+    def test_order_requires_account(self):
+        self.client.force_authenticate(user=self.mozo)
+        datos = {**self.datos}
+        datos.pop("cuenta")
+
+        response = self.client.post(
+            self.url,
+            datos,
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+            response.data,
+        )
         self.assertEqual(Pedido.objects.count(), 0)
 
     def test_order_rejects_invalid_table(self):
