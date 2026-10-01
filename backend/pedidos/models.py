@@ -127,6 +127,11 @@ class Pedido(models.Model):
 
 
 class DetallePedido(models.Model):
+    class EstadoPreparacion(models.TextChoices):
+        PENDIENTE = "PENDIENTE", "Pendiente"
+        EN_PREPARACION = "EN_PREPARACION", "En preparación"
+        LISTO = "LISTO", "Listo"
+
     pedido = models.ForeignKey(
         Pedido,
         on_delete=models.PROTECT,
@@ -155,6 +160,12 @@ class DetallePedido(models.Model):
         related_name="detalles_pedido",
     )
 
+    estado_preparacion = models.CharField(
+        max_length=20,
+        choices=EstadoPreparacion.choices,
+        default=EstadoPreparacion.PENDIENTE,
+    )
+
     def clean(self):
         super().clean()
 
@@ -180,6 +191,25 @@ class DetallePedido(models.Model):
 
         self.full_clean()
         super().save(*args, **kwargs)
+
+    def transicionar_a(self, nuevo_estado):
+        transiciones = {
+            self.EstadoPreparacion.PENDIENTE: self.EstadoPreparacion.EN_PREPARACION,
+            self.EstadoPreparacion.EN_PREPARACION: self.EstadoPreparacion.LISTO,
+        }
+
+        if transiciones.get(self.estado_preparacion) != nuevo_estado:
+            raise ValidationError(
+                {
+                    "estado_preparacion": (
+                        f"No se puede pasar de {self.estado_preparacion} "
+                        f"a {nuevo_estado}."
+                    )
+                }
+            )
+
+        self.estado_preparacion = nuevo_estado
+        self.save(update_fields=["estado_preparacion"])
 
     @property
     def subtotal(self):

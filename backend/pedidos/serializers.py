@@ -185,5 +185,12 @@ class DetallePedidoLecturaSerializer(serializers.ModelSerializer):
             "cantidad",
             "precio_unitario",
             "sector_destino",
+            "estado_preparacion",
         ]
         read_only_fields = fields
+
+
+class TransicionPreparacionSerializer(serializers.Serializer):
+    estado_preparacion = serializers.ChoiceField(
+        choices=DetallePedido.EstadoPreparacion.choices,
+    )
