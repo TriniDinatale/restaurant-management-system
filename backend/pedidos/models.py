@@ -125,13 +125,20 @@ class Pedido(models.Model):
     def __str__(self):
         return f"Pedido {self.pk} - {self.mesa}"
 
+    @property
+    def cocina_lista(self):
+        preparaciones_cocina = self.preparaciones_sectoriales.filter(
+            sector__nombre__in={
+                Sector.Nombre.PIZZA,
+                Sector.Nombre.PLATOS,
+            },
+        )
+        return preparaciones_cocina.exists() and not preparaciones_cocina.exclude(
+            estado=PreparacionPedidoSector.Estado.LISTO,
+        ).exists()
+
 
 class DetallePedido(models.Model):
-    class EstadoPreparacion(models.TextChoices):
-        PENDIENTE = "PENDIENTE", "Pendiente"
-        EN_PREPARACION = "EN_PREPARACION", "En preparación"
-        LISTO = "LISTO", "Listo"
-
     pedido = models.ForeignKey(
         Pedido,
         on_delete=models.PROTECT,
@@ -160,12 +167,6 @@ class DetallePedido(models.Model):
         related_name="detalles_pedido",
     )
 
-    estado_preparacion = models.CharField(
-        max_length=20,
-        choices=EstadoPreparacion.choices,
-        default=EstadoPreparacion.PENDIENTE,
-    )
-
     def clean(self):
         super().clean()
 
@@ -192,28 +193,69 @@ class DetallePedido(models.Model):
         self.full_clean()
         super().save(*args, **kwargs)
 
-    def transicionar_a(self, nuevo_estado):
-        transiciones = {
-            self.EstadoPreparacion.PENDIENTE: self.EstadoPreparacion.EN_PREPARACION,
-            self.EstadoPreparacion.EN_PREPARACION: self.EstadoPreparacion.LISTO,
-        }
-
-        if transiciones.get(self.estado_preparacion) != nuevo_estado:
-            raise ValidationError(
-                {
-                    "estado_preparacion": (
-                        f"No se puede pasar de {self.estado_preparacion} "
-                        f"a {nuevo_estado}."
-                    )
-                }
-            )
-
-        self.estado_preparacion = nuevo_estado
-        self.save(update_fields=["estado_preparacion"])
-
     @property
     def subtotal(self):
         return self.cantidad * self.precio_unitario
 
     def __str__(self):
         return f"{self.cantidad} x {self.producto.nombre}"
+
+
+class PreparacionPedidoSector(models.Model):
+    class Estado(models.TextChoices):
+        PENDIENTE = "PENDIENTE", "Pendiente"
+        EN_PREPARACION = "EN_PREPARACION", "En preparación"
+        LISTO = "LISTO", "Listo"
+
+    pedido = models.ForeignKey(
+        Pedido,
+        on_delete=models.CASCADE,
+        related_name="preparaciones_sectoriales",
+    )
+
+    sector = models.ForeignKey(
+        Sector,
+        on_delete=models.PROTECT,
+        related_name="preparaciones_pedido",
+    )
+
+    estado = models.CharField(
+        max_length=20,
+        choices=Estado.choices,
+        default=Estado.PENDIENTE,
+    )
+
+    fecha_creacion = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    class Meta:
+        ordering = ["pedido_id", "sector__nombre"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["pedido", "sector"],
+                name="unique_preparacion_pedido_sector",
+            ),
+        ]
+
+    def transicionar_a(self, nuevo_estado):
+        transiciones = {
+            self.Estado.PENDIENTE: self.Estado.EN_PREPARACION,
+            self.Estado.EN_PREPARACION: self.Estado.LISTO,
+        }
+
+        if transiciones.get(self.estado) != nuevo_estado:
+            raise ValidationError(
+                {
+                    "estado": (
+                        f"No se puede pasar de {self.estado} "
+                        f"a {nuevo_estado}."
+                    )
+                }
+            )
+
+        self.estado = nuevo_estado
+        self.save(update_fields=["estado"])
+
+    def __str__(self):
+        return f"Preparación del pedido {self.pedido_id} - {self.sector}"

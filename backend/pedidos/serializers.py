@@ -3,8 +3,15 @@ from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from productos.models import Producto
+from usuarios.models import Sector, User
 
-from .models import Mesa, Cuenta, Pedido, DetallePedido
+from .models import (
+    Cuenta,
+    DetallePedido,
+    Mesa,
+    Pedido,
+    PreparacionPedidoSector,
+)
 
 
 class DetallePedidoSerializer(serializers.ModelSerializer):
@@ -108,6 +115,20 @@ class PedidoSerializer(serializers.ModelSerializer):
                 **detalle_data,
             )
 
+        sectores_ids = pedido.detalles.values_list(
+            "sector_destino_id",
+            flat=True,
+        ).distinct()
+        PreparacionPedidoSector.objects.bulk_create(
+            [
+                PreparacionPedidoSector(
+                    pedido=pedido,
+                    sector_id=sector_id,
+                )
+                for sector_id in sectores_ids
+            ]
+        )
+
         return pedido
 
 
@@ -157,19 +178,9 @@ class CuentaSerializer(serializers.ModelSerializer):
             ) from exc
 
 
-class DetallePedidoLecturaSerializer(serializers.ModelSerializer):
+class DetallePreparacionProductoSerializer(serializers.ModelSerializer):
     producto_nombre = serializers.CharField(
         source="producto.nombre",
-        read_only=True,
-    )
-
-    mesa_numero = serializers.IntegerField(
-        source="pedido.mesa.numero",
-        read_only=True,
-    )
-
-    pedido_fecha = serializers.DateTimeField(
-        source="pedido.fecha_creacion",
         read_only=True,
     )
 
@@ -177,20 +188,74 @@ class DetallePedidoLecturaSerializer(serializers.ModelSerializer):
         model = DetallePedido
         fields = [
             "id",
-            "pedido",
-            "mesa_numero",
-            "pedido_fecha",
             "producto",
             "producto_nombre",
             "cantidad",
             "precio_unitario",
-            "sector_destino",
-            "estado_preparacion",
         ]
         read_only_fields = fields
 
 
+class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
+    pedido = serializers.IntegerField(
+        source="pedido_id",
+        read_only=True,
+    )
+    sector = serializers.CharField(
+        source="sector.nombre",
+        read_only=True,
+    )
+    detalles = serializers.SerializerMethodField()
+    coordinacion_cocina = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PreparacionPedidoSector
+        fields = [
+            "id",
+            "pedido",
+            "sector",
+            "estado",
+            "fecha_creacion",
+            "detalles",
+            "coordinacion_cocina",
+        ]
+        read_only_fields = fields
+
+    def get_detalles(self, preparacion):
+        detalles = preparacion.pedido.detalles.filter(
+            sector_destino_id=preparacion.sector_id,
+        ).select_related("producto")
+        return DetallePreparacionProductoSerializer(
+            detalles,
+            many=True,
+        ).data
+
+    def get_coordinacion_cocina(self, preparacion):
+        request = self.context.get("request")
+        if (
+            request is None
+            or request.user.rol != User.Rol.COCINA
+            or preparacion.sector.nombre
+            not in {Sector.Nombre.PIZZA, Sector.Nombre.PLATOS}
+        ):
+            return []
+
+        preparaciones = preparacion.pedido.preparaciones_sectoriales.filter(
+            sector__nombre__in={Sector.Nombre.PIZZA, Sector.Nombre.PLATOS},
+        ).exclude(
+            pk=preparacion.pk,
+        ).select_related("sector")
+
+        return [
+            {
+                "sector": otra.sector.nombre,
+                "estado": otra.estado,
+            }
+            for otra in preparaciones
+        ]
+
+
 class TransicionPreparacionSerializer(serializers.Serializer):
-    estado_preparacion = serializers.ChoiceField(
-        choices=DetallePedido.EstadoPreparacion.choices,
+    estado = serializers.ChoiceField(
+        choices=PreparacionPedidoSector.Estado.choices,
     )

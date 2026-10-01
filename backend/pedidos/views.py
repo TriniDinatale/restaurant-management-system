@@ -5,11 +5,11 @@ from rest_framework.response import Response
 
 from usuarios.permissions import IsMozo, IsPreparador
 
-from .models import DetallePedido, Pedido
+from .models import Pedido, PreparacionPedidoSector
 from .serializers import (
     CuentaSerializer,
-    DetallePedidoLecturaSerializer,
     PedidoSerializer,
+    PreparacionPedidoSectorSerializer,
     TransicionPreparacionSerializer,
 )
 
@@ -30,39 +30,38 @@ class PreparacionSectorMixin:
 
     def get_queryset(self):
         return (
-            DetallePedido.objects.filter(
-                sector_destino_id=self.request.user.sector_id,
+            PreparacionPedidoSector.objects.filter(
+                sector_id=self.request.user.sector_id,
             )
             .select_related(
                 "pedido",
                 "pedido__mesa",
-                "producto",
-                "sector_destino",
+                "sector",
             )
         )
 
 
-class DetallePreparacionListView(
+class PreparacionPedidoSectorListView(
     PreparacionSectorMixin,
     generics.ListAPIView,
 ):
-    serializer_class = DetallePedidoLecturaSerializer
+    serializer_class = PreparacionPedidoSectorSerializer
 
 
-class DetallePreparacionEstadoView(
+class PreparacionPedidoSectorEstadoView(
     PreparacionSectorMixin,
     generics.GenericAPIView,
 ):
     serializer_class = TransicionPreparacionSerializer
 
     def patch(self, request, *args, **kwargs):
-        detalle = self.get_object()
+        preparacion = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         try:
-            detalle.transicionar_a(
-                serializer.validated_data["estado_preparacion"],
+            preparacion.transicionar_a(
+                serializer.validated_data["estado"],
             )
         except DjangoValidationError as exc:
             raise serializers.ValidationError(
@@ -70,5 +69,8 @@ class DetallePreparacionEstadoView(
             ) from exc
 
         return Response(
-            DetallePedidoLecturaSerializer(detalle).data,
+            PreparacionPedidoSectorSerializer(
+                preparacion,
+                context=self.get_serializer_context(),
+            ).data,
         )

@@ -8,7 +8,13 @@ from django.test import TestCase
 from productos.models import Categoria, Producto
 from usuarios.models import Sector, User
 
-from .models import Mesa, Cuenta, Pedido, DetallePedido
+from .models import (
+    Cuenta,
+    DetallePedido,
+    Mesa,
+    Pedido,
+    PreparacionPedidoSector,
+)
 
 from django.urls import reverse
 from rest_framework import status
@@ -246,6 +252,15 @@ class PedidoAPITests(APITestCase):
             sector_destino=self.barra,
         )
 
+        self.producto_platos = Producto.objects.create(
+            nombre="Milanesa",
+            precio=Decimal("8000.00"),
+            categoria=self.categoria,
+            sector_destino=Sector.objects.create(
+                nombre=Sector.Nombre.PLATOS,
+            ),
+        )
+
         self.url = reverse("pedido-create")
 
         self.datos = {
@@ -324,6 +339,74 @@ class PedidoAPITests(APITestCase):
 
         self.assertEqual(pedido.mozo, self.mozo)
         self.assertEqual(pedido.mesa, self.mesa)
+        preparaciones = list(
+            pedido.preparaciones_sectoriales.select_related("sector")
+        )
+        self.assertEqual(len(preparaciones), 2)
+        self.assertEqual(
+            {preparacion.sector.nombre for preparacion in preparaciones},
+            {Sector.Nombre.PIZZA, Sector.Nombre.BARRA},
+        )
+        self.assertTrue(
+            all(
+                preparacion.estado
+                == PreparacionPedidoSector.Estado.PENDIENTE
+                for preparacion in preparaciones
+            )
+        )
+
+    def test_multiple_details_in_one_sector_create_one_preparation(self):
+        self.client.force_authenticate(user=self.mozo)
+        response = self.client.post(
+            self.url,
+            {
+                "mesa": self.mesa.pk,
+                "cuenta": self.cuenta.pk,
+                "detalles": [
+                    {"producto": self.producto_barra.pk, "cantidad": 1},
+                    {"producto": self.producto_barra.pk, "cantidad": 2},
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        pedido = Pedido.objects.get()
+        self.assertEqual(pedido.detalles.count(), 2)
+        self.assertEqual(pedido.preparaciones_sectoriales.count(), 1)
+        self.assertEqual(
+            pedido.preparaciones_sectoriales.get().sector,
+            self.barra,
+        )
+
+    def test_pizza_and_platos_create_independent_preparations(self):
+        self.client.force_authenticate(user=self.mozo)
+        response = self.client.post(
+            self.url,
+            {
+                "mesa": self.mesa.pk,
+                "cuenta": self.cuenta.pk,
+                "detalles": [
+                    {"producto": self.producto.pk, "cantidad": 1},
+                    {"producto": self.producto_platos.pk, "cantidad": 1},
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        pedido = Pedido.objects.get()
+        self.assertEqual(pedido.preparaciones_sectoriales.count(), 2)
+        self.assertEqual(
+            set(
+                pedido.preparaciones_sectoriales.values_list(
+                    "sector__nombre",
+                    flat=True,
+                )
+            ),
+            {Sector.Nombre.PIZZA, Sector.Nombre.PLATOS},
+        )
+        self.assertFalse(pedido.cocina_lista)
 
     def test_order_copies_prices_and_destination_sectors(self):
         self.client.force_authenticate(user=self.mozo)
@@ -577,6 +660,25 @@ class PedidoAPITests(APITestCase):
             DetallePedido.objects.count(),
             0,
         )
+        self.assertEqual(PreparacionPedidoSector.objects.count(), 0)
+
+    def test_order_rolls_back_if_preparation_creation_fails(self):
+        self.client.force_authenticate(user=self.mozo)
+
+        with patch(
+            "pedidos.serializers.PreparacionPedidoSector.objects.bulk_create",
+            side_effect=ValidationError("Error simulado al crear preparación."),
+        ):
+            with self.assertRaises(ValidationError):
+                self.client.post(
+                    self.url,
+                    self.datos,
+                    format="json",
+                )
+
+        self.assertEqual(Pedido.objects.count(), 0)
+        self.assertEqual(DetallePedido.objects.count(), 0)
+        self.assertEqual(PreparacionPedidoSector.objects.count(), 0)
     
     def test_order_rejects_closed_account(self):
         self.client.force_authenticate(user=self.mozo)
@@ -896,7 +998,7 @@ class CuentaAPITests(APITestCase):
         self.assertEqual(Cuenta.objects.count(), 0)
 
 
-class DetallePreparacionAPITests(APITestCase):
+class PreparacionPedidoSectorAPITests(APITestCase):
     def setUp(self):
         self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
         self.barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
@@ -945,146 +1047,208 @@ class DetallePreparacionAPITests(APITestCase):
         )
 
         self.detalles = {}
-        for nombre, sector in [
-            ("Bebida preparacion", self.barra),
-            ("Pizza preparacion", self.pizza),
-            ("Plato preparacion", self.platos),
+        for nombre, sector, cantidad in [
+            ("Bebida preparacion", self.barra, 2),
+            ("Pizza preparacion", self.pizza, 2),
+            ("Plato preparacion", self.platos, 2),
         ]:
-            producto = Producto.objects.create(
-                nombre=nombre,
-                precio=Decimal("1000.00"),
-                categoria=self.categoria,
-                sector_destino=sector,
-            )
-            self.detalles[sector.nombre] = DetallePedido.objects.create(
+            self.detalles[sector.nombre] = []
+            for indice in range(cantidad):
+                producto = Producto.objects.create(
+                    nombre=f"{nombre} {indice}",
+                    precio=Decimal("1000.00"),
+                    categoria=self.categoria,
+                    sector_destino=sector,
+                )
+                self.detalles[sector.nombre].append(
+                    DetallePedido.objects.create(
+                        pedido=self.pedido,
+                        producto=producto,
+                        cantidad=1,
+                    )
+                )
+
+        self.preparaciones = {
+            sector.nombre: PreparacionPedidoSector.objects.create(
                 pedido=self.pedido,
-                producto=producto,
-                cantidad=1,
+                sector=sector,
             )
+            for sector in [self.barra, self.pizza, self.platos]
+        }
 
         self.list_url = reverse("detalle-preparacion-list")
 
-    def estado_url(self, detalle):
+    def estado_url(self, preparacion):
         return reverse(
             "detalle-preparacion-estado",
-            args=[detalle.pk],
+            args=[preparacion.pk],
         )
 
-    def ids_visibles(self, response):
-        return {detalle["id"] for detalle in response.data}
+    def preparaciones_visibles(self, response):
+        return {preparacion["sector"]: preparacion for preparacion in response.data}
 
-    def test_new_detail_starts_pending(self):
-        for detalle in self.detalles.values():
-            with self.subTest(sector=detalle.sector_destino.nombre):
+    def test_new_preparations_start_pending_and_are_unique_per_sector(self):
+        self.assertEqual(PreparacionPedidoSector.objects.count(), 3)
+        for preparacion in self.preparaciones.values():
+            with self.subTest(sector=preparacion.sector.nombre):
                 self.assertEqual(
-                    detalle.estado_preparacion,
-                    DetallePedido.EstadoPreparacion.PENDIENTE,
+                    preparacion.estado,
+                    PreparacionPedidoSector.Estado.PENDIENTE,
                 )
 
-    def test_barra_only_sees_bar_details(self):
+    def test_barra_only_sees_bar_preparation_and_products(self):
         self.client.force_authenticate(user=self.usuario_barra)
 
         response = self.client.get(self.list_url)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        visible = self.preparaciones_visibles(response)
+        self.assertEqual(set(visible), {Sector.Nombre.BARRA})
         self.assertEqual(
-            self.ids_visibles(response),
-            {self.detalles[Sector.Nombre.BARRA].pk},
+            len(visible[Sector.Nombre.BARRA]["detalles"]),
+            2,
         )
+        self.assertEqual(visible[Sector.Nombre.BARRA]["coordinacion_cocina"], [])
 
-    def test_pizza_kitchen_only_sees_pizza_details(self):
+    def test_pizza_kitchen_sees_only_pizza_products_and_platos_status(self):
         self.client.force_authenticate(user=self.cocina_pizza)
 
         response = self.client.get(self.list_url)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        visible = self.preparaciones_visibles(response)
+        self.assertEqual(set(visible), {Sector.Nombre.PIZZA})
+        self.assertEqual(len(visible[Sector.Nombre.PIZZA]["detalles"]), 2)
         self.assertEqual(
-            self.ids_visibles(response),
-            {self.detalles[Sector.Nombre.PIZZA].pk},
+            visible[Sector.Nombre.PIZZA]["coordinacion_cocina"],
+            [{"sector": Sector.Nombre.PLATOS, "estado": "PENDIENTE"}],
         )
 
-    def test_platos_kitchen_only_sees_platos_details(self):
+    def test_platos_kitchen_sees_only_platos_products_and_pizza_status(self):
         self.client.force_authenticate(user=self.cocina_platos)
 
         response = self.client.get(self.list_url)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        visible = self.preparaciones_visibles(response)
+        self.assertEqual(set(visible), {Sector.Nombre.PLATOS})
+        self.assertEqual(len(visible[Sector.Nombre.PLATOS]["detalles"]), 2)
         self.assertEqual(
-            self.ids_visibles(response),
-            {self.detalles[Sector.Nombre.PLATOS].pk},
+            visible[Sector.Nombre.PLATOS]["coordinacion_cocina"],
+            [{"sector": Sector.Nombre.PIZZA, "estado": "PENDIENTE"}],
         )
 
-    def test_barra_can_advance_its_detail_to_ready(self):
-        detalle = self.detalles[Sector.Nombre.BARRA]
+    def test_single_sector_orders_have_no_cooking_coordination(self):
+        PreparacionPedidoSector.objects.filter(
+            pedido=self.pedido,
+            sector__nombre=Sector.Nombre.PLATOS,
+        ).delete()
+
+        self.client.force_authenticate(user=self.cocina_pizza)
+        pizza_response = self.client.get(self.list_url)
+        self.assertEqual(
+            self.preparaciones_visibles(pizza_response)[Sector.Nombre.PIZZA][
+                "coordinacion_cocina"
+            ],
+            [],
+        )
+
+        self.client.force_authenticate(user=self.cocina_platos)
+        platos_response = self.client.get(self.list_url)
+        self.assertEqual(platos_response.data, [])
+
+    def test_client_sector_parameter_does_not_change_visible_preparations(self):
+        self.client.force_authenticate(user=self.cocina_pizza)
+
+        response = self.client.get(
+            self.list_url,
+            {"sector": Sector.Nombre.PLATOS},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            set(self.preparaciones_visibles(response)),
+            {Sector.Nombre.PIZZA},
+        )
+
+    def test_barra_can_advance_its_preparation_to_ready(self):
+        preparacion = self.preparaciones[Sector.Nombre.BARRA]
         self.client.force_authenticate(user=self.usuario_barra)
 
         response = self.client.patch(
-            self.estado_url(detalle),
-            {"estado_preparacion": DetallePedido.EstadoPreparacion.EN_PREPARACION},
+            self.estado_url(preparacion),
+            {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
             format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(
-            response.data["estado_preparacion"],
-            DetallePedido.EstadoPreparacion.EN_PREPARACION,
+            response.data["estado"],
+            PreparacionPedidoSector.Estado.EN_PREPARACION,
         )
 
         response = self.client.patch(
-            self.estado_url(detalle),
-            {"estado_preparacion": DetallePedido.EstadoPreparacion.LISTO},
+            self.estado_url(preparacion),
+            {"estado": PreparacionPedidoSector.Estado.LISTO},
             format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(
-            response.data["estado_preparacion"],
-            DetallePedido.EstadoPreparacion.LISTO,
+            response.data["estado"],
+            PreparacionPedidoSector.Estado.LISTO,
         )
 
-    def test_kitchen_can_advance_details_in_its_assigned_sector(self):
+    def test_kitchen_can_advance_only_its_sector_preparation(self):
         for usuario, nombre_sector in [
             (self.cocina_pizza, Sector.Nombre.PIZZA),
             (self.cocina_platos, Sector.Nombre.PLATOS),
         ]:
             with self.subTest(sector=nombre_sector):
-                detalle = self.detalles[nombre_sector]
+                preparacion = self.preparaciones[nombre_sector]
                 self.client.force_authenticate(user=usuario)
 
                 response = self.client.patch(
-                    self.estado_url(detalle),
-                    {"estado_preparacion": DetallePedido.EstadoPreparacion.EN_PREPARACION},
+                    self.estado_url(preparacion),
+                    {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
                     format="json",
                 )
                 self.assertEqual(response.status_code, status.HTTP_200_OK)
 
                 response = self.client.patch(
-                    self.estado_url(detalle),
-                    {"estado_preparacion": DetallePedido.EstadoPreparacion.LISTO},
+                    self.estado_url(preparacion),
+                    {"estado": PreparacionPedidoSector.Estado.LISTO},
                     format="json",
                 )
                 self.assertEqual(response.status_code, status.HTTP_200_OK)
                 self.assertEqual(
-                    response.data["estado_preparacion"],
-                    DetallePedido.EstadoPreparacion.LISTO,
+                    response.data["estado"],
+                    PreparacionPedidoSector.Estado.LISTO,
                 )
 
-    def test_worker_cannot_transition_detail_from_another_sector(self):
-        detalle = self.detalles[Sector.Nombre.PIZZA]
-        self.client.force_authenticate(user=self.usuario_barra)
+    def test_workers_cannot_transition_preparation_from_another_sector(self):
+        for usuario, otro_sector in [
+            (self.usuario_barra, Sector.Nombre.PIZZA),
+            (self.usuario_barra, Sector.Nombre.PLATOS),
+            (self.cocina_pizza, Sector.Nombre.PLATOS),
+            (self.cocina_platos, Sector.Nombre.PIZZA),
+        ]:
+            with self.subTest(usuario=usuario.username, sector=otro_sector):
+                preparacion = self.preparaciones[otro_sector]
+                self.client.force_authenticate(user=usuario)
 
-        response = self.client.patch(
-            self.estado_url(detalle),
-            {"estado_preparacion": DetallePedido.EstadoPreparacion.EN_PREPARACION},
-            format="json",
-        )
+                response = self.client.patch(
+                    self.estado_url(preparacion),
+                    {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
+                    format="json",
+                )
 
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        detalle.refresh_from_db()
-        self.assertEqual(
-            detalle.estado_preparacion,
-            DetallePedido.EstadoPreparacion.PENDIENTE,
-        )
+                self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+                preparacion.refresh_from_db()
+                self.assertEqual(
+                    preparacion.estado,
+                    PreparacionPedidoSector.Estado.PENDIENTE,
+                )
 
     def test_mozo_and_admin_cannot_access_preparation(self):
         for usuario in [self.mozo, self.admin]:
@@ -1093,8 +1257,8 @@ class DetallePreparacionAPITests(APITestCase):
 
                 list_response = self.client.get(self.list_url)
                 transition_response = self.client.patch(
-                    self.estado_url(self.detalles[Sector.Nombre.BARRA]),
-                    {"estado_preparacion": DetallePedido.EstadoPreparacion.EN_PREPARACION},
+                    self.estado_url(self.preparaciones[Sector.Nombre.BARRA]),
+                    {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
                     format="json",
                 )
 
@@ -1111,8 +1275,8 @@ class DetallePreparacionAPITests(APITestCase):
         responses = [
             self.client.get(self.list_url),
             self.client.patch(
-                self.estado_url(self.detalles[Sector.Nombre.BARRA]),
-                {"estado_preparacion": DetallePedido.EstadoPreparacion.EN_PREPARACION},
+                self.estado_url(self.preparaciones[Sector.Nombre.BARRA]),
+                {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
                 format="json",
             ),
         ]
@@ -1126,70 +1290,141 @@ class DetallePreparacionAPITests(APITestCase):
                 },
             )
 
-    def test_cannot_skip_pending_and_mark_detail_ready(self):
-        detalle = self.detalles[Sector.Nombre.BARRA]
+    def test_invalid_transitions_do_not_change_persisted_state(self):
+        invalid_transitions = [
+            (PreparacionPedidoSector.Estado.PENDIENTE, PreparacionPedidoSector.Estado.LISTO),
+            (PreparacionPedidoSector.Estado.PENDIENTE, PreparacionPedidoSector.Estado.PENDIENTE),
+            (PreparacionPedidoSector.Estado.EN_PREPARACION, PreparacionPedidoSector.Estado.PENDIENTE),
+            (PreparacionPedidoSector.Estado.EN_PREPARACION, PreparacionPedidoSector.Estado.EN_PREPARACION),
+            (PreparacionPedidoSector.Estado.LISTO, PreparacionPedidoSector.Estado.EN_PREPARACION),
+            (PreparacionPedidoSector.Estado.LISTO, PreparacionPedidoSector.Estado.PENDIENTE),
+            (PreparacionPedidoSector.Estado.LISTO, PreparacionPedidoSector.Estado.LISTO),
+        ]
         self.client.force_authenticate(user=self.usuario_barra)
+        preparacion = self.preparaciones[Sector.Nombre.BARRA]
 
-        response = self.client.patch(
-            self.estado_url(detalle),
-            {"estado_preparacion": DetallePedido.EstadoPreparacion.LISTO},
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        detalle.refresh_from_db()
-        self.assertEqual(
-            detalle.estado_preparacion,
-            DetallePedido.EstadoPreparacion.PENDIENTE,
-        )
-
-    def test_repeated_transition_is_rejected_without_changing_state(self):
-        detalle = self.detalles[Sector.Nombre.BARRA]
-        self.client.force_authenticate(user=self.usuario_barra)
-        payload = {
-            "estado_preparacion": DetallePedido.EstadoPreparacion.EN_PREPARACION,
-        }
-
-        first_response = self.client.patch(
-            self.estado_url(detalle),
-            payload,
-            format="json",
-        )
-        second_response = self.client.patch(
-            self.estado_url(detalle),
-            payload,
-            format="json",
-        )
-
-        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(second_response.status_code, status.HTTP_400_BAD_REQUEST)
-        detalle.refresh_from_db()
-        self.assertEqual(
-            detalle.estado_preparacion,
-            DetallePedido.EstadoPreparacion.EN_PREPARACION,
-        )
-
-    def test_ready_detail_cannot_move_backwards(self):
-        detalle = self.detalles[Sector.Nombre.BARRA]
-        self.client.force_authenticate(user=self.usuario_barra)
-        detalle.estado_preparacion = DetallePedido.EstadoPreparacion.LISTO
-        detalle.save(update_fields=["estado_preparacion"])
-
-        for estado in [
-            DetallePedido.EstadoPreparacion.EN_PREPARACION,
-            DetallePedido.EstadoPreparacion.PENDIENTE,
-        ]:
-            with self.subTest(estado=estado):
+        for estado_inicial, estado_solicitado in invalid_transitions:
+            with self.subTest(
+                estado_inicial=estado_inicial,
+                estado_solicitado=estado_solicitado,
+            ):
+                PreparacionPedidoSector.objects.filter(pk=preparacion.pk).update(
+                    estado=estado_inicial,
+                )
                 response = self.client.patch(
-                    self.estado_url(detalle),
-                    {"estado_preparacion": estado},
+                    self.estado_url(preparacion),
+                    {"estado": estado_solicitado},
                     format="json",
                 )
 
                 self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-                detalle.refresh_from_db()
-                self.assertEqual(
-                    detalle.estado_preparacion,
-                    DetallePedido.EstadoPreparacion.LISTO,
+                preparacion.refresh_from_db()
+                self.assertEqual(preparacion.estado, estado_inicial)
+
+    def test_cooking_ready_is_derived_from_all_present_cooking_sectors(self):
+        pizza = self.preparaciones[Sector.Nombre.PIZZA]
+        platos = self.preparaciones[Sector.Nombre.PLATOS]
+
+        pizza.estado = PreparacionPedidoSector.Estado.LISTO
+        pizza.save(update_fields=["estado"])
+        self.assertFalse(self.pedido.cocina_lista)
+
+        platos.estado = PreparacionPedidoSector.Estado.LISTO
+        platos.save(update_fields=["estado"])
+        self.assertTrue(self.pedido.cocina_lista)
+
+        self.preparaciones[Sector.Nombre.BARRA].estado = (
+            PreparacionPedidoSector.Estado.EN_PREPARACION
+        )
+        self.preparaciones[Sector.Nombre.BARRA].save(update_fields=["estado"])
+        self.assertTrue(self.pedido.cocina_lista)
+
+    def test_cooking_ready_for_orders_with_only_one_cooking_sector(self):
+        for numero_mesa, sector in [
+            (31, self.pizza),
+            (32, self.platos),
+        ]:
+            with self.subTest(sector=sector.nombre):
+                mesa = Mesa.objects.create(numero=numero_mesa)
+                cuenta = Cuenta.objects.create(mesa=mesa)
+                pedido = Pedido.objects.create(
+                    mesa=mesa,
+                    mozo=self.mozo,
+                    cuenta=cuenta,
                 )
+                producto = self.detalles[sector.nombre][0].producto
+                DetallePedido.objects.create(
+                    pedido=pedido,
+                    producto=producto,
+                    cantidad=1,
+                )
+                preparacion = PreparacionPedidoSector.objects.create(
+                    pedido=pedido,
+                    sector=sector,
+                )
+
+                self.assertEqual(
+                    list(
+                        pedido.preparaciones_sectoriales.values_list(
+                            "sector__nombre",
+                            flat=True,
+                        )
+                    ),
+                    [sector.nombre],
+                )
+                preparacion.estado = PreparacionPedidoSector.Estado.LISTO
+                preparacion.save(update_fields=["estado"])
+                self.assertTrue(pedido.cocina_lista)
+
+    def test_bar_preparation_does_not_participate_in_cooking_ready(self):
+        self.preparaciones[Sector.Nombre.PIZZA].delete()
+        self.preparaciones[Sector.Nombre.PLATOS].delete()
+        self.preparaciones[Sector.Nombre.BARRA].estado = (
+            PreparacionPedidoSector.Estado.LISTO
+        )
+        self.preparaciones[Sector.Nombre.BARRA].save(update_fields=["estado"])
+        self.assertFalse(self.pedido.cocina_lista)
+
+    def test_cooking_preparations_change_independently(self):
+        pizza = self.preparaciones[Sector.Nombre.PIZZA]
+        platos = self.preparaciones[Sector.Nombre.PLATOS]
+        self.client.force_authenticate(user=self.cocina_pizza)
+
+        response = self.client.patch(
+            self.estado_url(pizza),
+            {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        platos.refresh_from_db()
+        self.assertEqual(platos.estado, PreparacionPedidoSector.Estado.PENDIENTE)
+
+        response = self.client.patch(
+            self.estado_url(pizza),
+            {"estado": PreparacionPedidoSector.Estado.LISTO},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        platos.refresh_from_db()
+        self.assertEqual(platos.estado, PreparacionPedidoSector.Estado.PENDIENTE)
+        self.assertFalse(self.pedido.cocina_lista)
+
+        self.client.force_authenticate(user=self.cocina_platos)
+        for estado in [
+            PreparacionPedidoSector.Estado.EN_PREPARACION,
+            PreparacionPedidoSector.Estado.LISTO,
+        ]:
+            response = self.client.patch(
+                self.estado_url(platos),
+                {"estado": estado},
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        pizza.refresh_from_db()
+        platos.refresh_from_db()
+        self.assertEqual(pizza.estado, PreparacionPedidoSector.Estado.LISTO)
+        self.assertEqual(platos.estado, PreparacionPedidoSector.Estado.LISTO)
+        self.assertTrue(self.pedido.cocina_lista)
 

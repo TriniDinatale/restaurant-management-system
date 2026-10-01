@@ -2,10 +2,10 @@
 from django.urls import path
 
 from .views import (
-    DetallePreparacionEstadoView,
-    DetallePreparacionListView,
     PedidoCreateView,
     CuentaCreateView,
+    PreparacionPedidoSectorEstadoView,
+    PreparacionPedidoSectorListView,
 )
 
 urlpatterns = [
@@ -22,12 +22,12 @@ urlpatterns = [
     ),
     path(
         "preparacion/",
-        DetallePreparacionListView.as_view(),
+        PreparacionPedidoSectorListView.as_view(),
         name="detalle-preparacion-list",
     ),
     path(
         "preparacion/<int:pk>/estado/",
-        DetallePreparacionEstadoView.as_view(),
+        PreparacionPedidoSectorEstadoView.as_view(),
         name="detalle-preparacion-estado",
     ),
 ]
