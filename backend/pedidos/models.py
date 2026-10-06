@@ -2,7 +2,7 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
-from django.db import models
+from django.db import models, transaction
 
 from productos.models import Producto
 from usuarios.models import Sector, User
@@ -93,6 +93,19 @@ class Pedido(models.Model):
         related_name="pedidos",
     )
 
+    retiro_habilitado_en = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    retiro_habilitado_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="retiros_habilitados",
+    )
+
 
     class Meta:
         ordering = ["-fecha_creacion"]
@@ -136,6 +149,52 @@ class Pedido(models.Model):
         return preparaciones_cocina.exists() and not preparaciones_cocina.exclude(
             estado=PreparacionPedidoSector.Estado.LISTO,
         ).exists()
+
+    def preparaciones_listas_para_retiro(self):
+        preparaciones = list(self.preparaciones_sectoriales.all())
+        return bool(preparaciones) and all(
+            preparacion.estado == PreparacionPedidoSector.Estado.LISTO
+            for preparacion in preparaciones
+        )
+
+    @property
+    def puede_habilitar_retiro(self):
+        return (
+            self.retiro_habilitado_en is None
+            and self.preparaciones_listas_para_retiro()
+        )
+
+    @transaction.atomic
+    def habilitar_retiro(self, usuario):
+        pedido = Pedido.objects.select_for_update().select_related(
+            "mesa",
+            "mozo",
+        ).get(pk=self.pk)
+
+        if pedido.retiro_habilitado_en is not None:
+            self.retiro_habilitado_en = pedido.retiro_habilitado_en
+            self.retiro_habilitado_por = pedido.retiro_habilitado_por
+            return pedido.avisos_retiro.get()
+
+        if not pedido.preparaciones_listas_para_retiro():
+            raise ValidationError(
+                "Todas las preparaciones deben estar listas para habilitar el retiro."
+            )
+
+        fecha_habilitacion = timezone.now()
+        Pedido.objects.filter(pk=pedido.pk).update(
+            retiro_habilitado_en=fecha_habilitacion,
+            retiro_habilitado_por=usuario,
+        )
+        aviso = AvisoRetiro.objects.create(
+            pedido=pedido,
+            destinatario=pedido.mozo,
+            mensaje=f"Mesa {pedido.mesa.numero}",
+        )
+
+        self.retiro_habilitado_en = fecha_habilitacion
+        self.retiro_habilitado_por = usuario
+        return aviso
 
 
 class DetallePedido(models.Model):
@@ -259,3 +318,30 @@ class PreparacionPedidoSector(models.Model):
 
     def __str__(self):
         return f"Preparación del pedido {self.pedido_id} - {self.sector}"
+
+
+class AvisoRetiro(models.Model):
+    pedido = models.ForeignKey(
+        Pedido,
+        on_delete=models.CASCADE,
+        related_name="avisos_retiro",
+    )
+
+    destinatario = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="avisos_retiro",
+    )
+
+    mensaje = models.CharField(max_length=100)
+
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-fecha_creacion"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["pedido"],
+                name="unique_aviso_retiro_por_pedido",
+            ),
+        ]

@@ -6,6 +6,7 @@ from productos.models import Producto
 from usuarios.models import Sector, User
 
 from .models import (
+    AvisoRetiro,
     Cuenta,
     DetallePedido,
     Mesa,
@@ -67,12 +68,16 @@ class PedidoSerializer(serializers.ModelSerializer):
             "mozo",
             "fecha_creacion",
             "detalles",
+            "retiro_habilitado_en",
+            "retiro_habilitado_por",
         ]
 
         read_only_fields = [
             "id",
             "mozo",
             "fecha_creacion",
+            "retiro_habilitado_en",
+            "retiro_habilitado_por",
         ]
 
     def validate_detalles(self, value):
@@ -253,6 +258,71 @@ class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
             }
             for otra in preparaciones
         ]
+
+
+class ControlRetiroBarraSerializer(serializers.ModelSerializer):
+    mesa = serializers.IntegerField(
+        source="mesa.numero",
+        read_only=True,
+    )
+    pedido = serializers.IntegerField(
+        source="pk",
+        read_only=True,
+    )
+    mozo_id = serializers.IntegerField(
+        read_only=True,
+    )
+    mozo_nombre = serializers.SerializerMethodField()
+    estados_sectores = serializers.SerializerMethodField()
+    retiro_habilitado = serializers.SerializerMethodField()
+    puede_habilitar_retiro = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Pedido
+        fields = [
+            "mesa",
+            "pedido",
+            "mozo_id",
+            "mozo_nombre",
+            "estados_sectores",
+            "retiro_habilitado",
+            "puede_habilitar_retiro",
+        ]
+        read_only_fields = fields
+
+    def get_mozo_nombre(self, pedido):
+        return pedido.mozo.get_full_name().strip() or pedido.mozo.username
+
+    def get_estados_sectores(self, pedido):
+        return [
+            {
+                "sector": preparacion.sector.nombre,
+                "estado": preparacion.estado,
+            }
+            for preparacion in pedido.preparaciones_sectoriales.select_related(
+                "sector",
+            )
+        ]
+
+    def get_retiro_habilitado(self, pedido):
+        return pedido.retiro_habilitado_en is not None
+
+
+class AvisoRetiroSerializer(serializers.ModelSerializer):
+    pedido = serializers.IntegerField(
+        source="pedido_id",
+        read_only=True,
+    )
+
+    class Meta:
+        model = AvisoRetiro
+        fields = [
+            "id",
+            "pedido",
+            "mensaje",
+            "fecha_creacion",
+        ]
+        read_only_fields = fields
 
 
 class TransicionPreparacionSerializer(serializers.Serializer):
