@@ -1,0 +1,25 @@
+{% extends "usuarios/base.html" %}
+{% block title %}Ingresar · Gestión del restaurante{% endblock %}
+{% block page_name %}login{% endblock %}
+{% block content %}
+<main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+        <div class="brand-mark" aria-hidden="true">R</div>
+        <p class="eyebrow">GESTIÓN DEL RESTAURANTE</p>
+        <h1 id="login-title">Ingresar</h1>
+        <p class="intro">Usá tu cuenta del restaurante para continuar.</p>
+        <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
+        <form id="login-form">
+            <label for="username">Usuario</label>
+            <input id="username" name="username" type="text" autocomplete="username"
+                   required autofocus>
+            <label for="password">Contraseña</label>
+            <input id="password" name="password" type="password"
+                   autocomplete="current-password" required>
+            <button class="button button-primary button-full" type="submit">
+                Ingresar
+            </button>
+        </form>
+    </section>
+</main>
+{% endblock %}

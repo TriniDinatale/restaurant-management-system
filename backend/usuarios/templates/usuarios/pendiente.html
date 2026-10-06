@@ -1,0 +1,28 @@
+{% extends "usuarios/base.html" %}
+{% block title %}Pantalla pendiente · Gestión del restaurante{% endblock %}
+{% block page_name %}pendiente{% endblock %}
+{% block content %}
+<header class="topbar">
+    <a class="brand" href="/" aria-label="Gestión del restaurante, inicio">
+        <span class="brand-mark brand-mark-small" aria-hidden="true">R</span>
+        <span>Restaurante</span>
+    </a>
+    <div class="user-tools">
+        <span id="user-label" class="user-label">Cargando usuario…</span>
+        <button id="logout-button" class="button button-quiet" type="button">
+            Cerrar sesión
+        </button>
+    </div>
+</header>
+<main class="page-shell pending-shell">
+    <section class="pending-card">
+        <p class="eyebrow">PRÓXIMAMENTE</p>
+        <h1>Tu pantalla operativa está pendiente</h1>
+        <p class="intro">
+            El acceso está habilitado. La pantalla para este rol todavía no
+            forma parte del MVP.
+        </p>
+    </section>
+    <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
+</main>
+{% endblock %}
