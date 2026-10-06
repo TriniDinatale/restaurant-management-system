@@ -3,10 +3,14 @@ from django.urls import path
 
 from .views import (
     PedidoCreateView,
-    CuentaCreateView,
+    CuentaListCreateView,
     AvisosRetiroListView,
     ConfirmarRetiroView,
     ControlRetiroBarraListView,
+    MesaListView,
+    BarraPedidoCreateView,
+    AvisosCargaBarraListView,
+    RegistroCargaBarraListView,
     PreparacionPedidoSectorEstadoView,
     PreparacionPedidoSectorListView,
 )
@@ -18,9 +22,25 @@ urlpatterns = [
         name="pedido-create",
     ),
     
+    path("mesas/", MesaListView.as_view(), name="mesa-list"),
+    path(
+        "barra/cargas/",
+        BarraPedidoCreateView.as_view(),
+        name="barra-carga-create",
+    ),
+    path(
+        "barra/cargas/registro/",
+        RegistroCargaBarraListView.as_view(),
+        name="barra-carga-registro",
+    ),
+    path(
+        "avisos/cargas/",
+        AvisosCargaBarraListView.as_view(),
+        name="aviso-carga-barra-list",
+    ),
     path(
         "cuentas/",
-        CuentaCreateView.as_view(),
+        CuentaListCreateView.as_view(),
         name="cuenta-create",
     ),
     path(

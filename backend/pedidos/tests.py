@@ -10,6 +10,7 @@ from usuarios.models import Sector, User
 
 from .models import (
     AvisoRetiro,
+    AvisoCargaBarra,
     Cuenta,
     DetallePedido,
     Mesa,
@@ -69,11 +70,42 @@ class PedidoModelTests(TestCase):
             cuenta=self.cuenta,
         )
 
-    def test_mesa_has_unique_number(self):
-        mesa = Mesa(numero=1)
+    def test_mesa_number_is_unique_within_zone(self):
+        mesa = Mesa(numero=1, zona=Mesa.Zona.SALON)
 
         with self.assertRaises(ValidationError):
             mesa.full_clean()
+
+    def test_database_rejects_duplicate_number_in_same_zone(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Mesa.objects.bulk_create(
+                    [Mesa(numero=1, zona=Mesa.Zona.SALON)]
+                )
+
+    def test_same_mesa_number_is_allowed_in_different_zones(self):
+        salon = Mesa.objects.create(numero=2, zona=Mesa.Zona.SALON)
+        vereda_a = Mesa.objects.create(numero=2, zona=Mesa.Zona.VEREDA_A)
+        vereda_b = Mesa.objects.create(numero=2, zona=Mesa.Zona.VEREDA_B)
+
+        self.assertEqual(
+            {salon.numero, vereda_a.numero, vereda_b.numero},
+            {2},
+        )
+
+    def test_mesa_identification_uses_zone_label_and_number(self):
+        casos = [
+            (Mesa.Zona.SALON, "Salón · Mesa 8"),
+            (Mesa.Zona.VEREDA_A, "Vereda A · Mesa 3"),
+            (Mesa.Zona.VEREDA_B, "Vereda B · Mesa 3"),
+        ]
+
+        for zona, identificacion in casos:
+            with self.subTest(zona=zona):
+                numero = 8 if zona == Mesa.Zona.SALON else 3
+                mesa = Mesa(numero=numero, zona=zona)
+                self.assertEqual(mesa.identificacion, identificacion)
+                self.assertEqual(str(mesa), identificacion)
 
     def test_pedido_must_belong_to_mozo(self):
         pedido = Pedido(
@@ -337,8 +369,11 @@ class PedidoAPITests(APITestCase):
         self.assertEqual(DetallePedido.objects.count(), 2)
 
         pedido = Pedido.objects.get()
+        self.cuenta.refresh_from_db()
 
         self.assertEqual(pedido.mozo, self.mozo)
+        self.assertEqual(pedido.creado_por, self.mozo)
+        self.assertEqual(self.cuenta.mozo_responsable, self.mozo)
         self.assertEqual(pedido.mesa, self.mesa)
         preparaciones = list(
             pedido.preparaciones_sectoriales.select_related("sector")
@@ -469,6 +504,67 @@ class PedidoAPITests(APITestCase):
         )
 
         self.assertEqual(Pedido.objects.count(), 0)
+
+    def test_only_account_responsible_can_add_waiter_orders(self):
+        self.client.force_authenticate(user=self.mozo)
+        primera_respuesta = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+        self.assertEqual(primera_respuesta.status_code, status.HTTP_201_CREATED)
+
+        otro_mozo = User.objects.create_user(
+            username="otro_mozo_api",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.client.force_authenticate(user=otro_mozo)
+        respuesta_rechazada = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+
+        self.assertEqual(
+            respuesta_rechazada.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn("responsable", str(respuesta_rechazada.data).lower())
+        self.assertEqual(Pedido.objects.count(), 1)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.mozo_responsable, self.mozo)
+
+        self.client.force_authenticate(user=self.mozo)
+        respuesta_responsable = self.client.post(
+            self.url,
+            self.datos,
+            format="json",
+        )
+        self.assertEqual(
+            respuesta_responsable.status_code,
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(Pedido.objects.count(), 2)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.mozo_responsable, self.mozo)
+
+    def test_legacy_account_with_orders_is_not_assigned_implicitly(self):
+        Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=self.cuenta,
+            mozo=self.mozo,
+        )
+        self.client.force_authenticate(user=self.mozo)
+
+        response = self.client.post(self.url, self.datos, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("histórica", str(response.data).lower())
+        self.cuenta.refresh_from_db()
+        self.assertIsNone(self.cuenta.mozo_responsable_id)
+        self.assertEqual(Pedido.objects.count(), 1)
 
     def test_order_requires_account(self):
         self.client.force_authenticate(user=self.mozo)
@@ -656,6 +752,9 @@ class PedidoAPITests(APITestCase):
             Pedido.objects.count(),
             0,
         )
+        self.cuenta.refresh_from_db()
+        self.assertIsNone(self.cuenta.mozo_responsable_id)
+        self.assertEqual(PreparacionPedidoSector.objects.count(), 0)
 
         self.assertEqual(
             DetallePedido.objects.count(),
@@ -725,6 +824,302 @@ class PedidoAPITests(APITestCase):
         self.assertEqual(DetallePedido.objects.count(), 0)
 
         
+
+class BarraCargaAPITests(APITestCase):
+    def setUp(self):
+        self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        self.barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.pizza = Sector.objects.create(nombre=Sector.Nombre.PIZZA)
+        self.mozo = User.objects.create_user(
+            username="mozo_responsable",
+            password="test-password",
+            first_name="Ana",
+            last_name="Gomez",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.otro_mozo = User.objects.create_user(
+            username="otro_mozo_responsable",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.usuario_barra = User.objects.create_user(
+            username="usuario_barra_cargas",
+            password="test-password",
+            rol=User.Rol.BARRA,
+            sector=self.barra,
+        )
+        self.admin = User.objects.create_user(
+            username="admin_cargas",
+            password="test-password",
+            rol=User.Rol.ADMINISTRADOR,
+        )
+        self.cocina = User.objects.create_user(
+            username="cocina_cargas",
+            password="test-password",
+            rol=User.Rol.COCINA,
+            sector=self.pizza,
+        )
+
+        self.mesa = Mesa.objects.create(
+            numero=1,
+            zona=Mesa.Zona.VEREDA_B,
+        )
+        self.cuenta = Cuenta.objects.create(mesa=self.mesa)
+        self.categoria = Categoria.objects.create(nombre="Carga desde barra")
+        self.bebida = Producto.objects.create(
+            nombre="Limonada",
+            precio=Decimal("2500.00"),
+            categoria=self.categoria,
+            sector_destino=self.barra,
+        )
+        self.comida = Producto.objects.create(
+            nombre="Empanada",
+            precio=Decimal("1800.00"),
+            categoria=self.categoria,
+            sector_destino=self.pizza,
+        )
+        self.pedido_url = reverse("pedido-create")
+        self.carga_url = reverse("barra-carga-create")
+        self.avisos_url = reverse("aviso-carga-barra-list")
+        self.registro_url = reverse("barra-carga-registro")
+
+    def crear_responsable(self, cuenta=None, mesa=None, mozo=None):
+        cuenta = cuenta or self.cuenta
+        mesa = mesa or cuenta.mesa
+        self.client.force_authenticate(user=mozo or self.mozo)
+        response = self.client.post(
+            self.pedido_url,
+            {
+                "mesa": mesa.pk,
+                "cuenta": cuenta.pk,
+                "detalles": [
+                    {"producto": self.comida.pk, "cantidad": 1},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        cuenta.refresh_from_db()
+        return response
+
+    def cargar_desde_barra(self, cuenta=None, mesa=None, usuario=None):
+        cuenta = cuenta or self.cuenta
+        mesa = mesa or cuenta.mesa
+        self.client.force_authenticate(user=usuario or self.usuario_barra)
+        return self.client.post(
+            self.carga_url,
+            {
+                "mesa": mesa.pk,
+                "cuenta": cuenta.pk,
+                "mozo": self.otro_mozo.pk,
+                "creado_por": self.admin.pk,
+                "detalles": [
+                    {"producto": self.bebida.pk, "cantidad": 3},
+                    {"producto": self.comida.pk, "cantidad": 2},
+                ],
+            },
+            format="json",
+        )
+
+    def test_barra_load_uses_responsible_and_records_author_and_notice_details(self):
+        self.crear_responsable()
+
+        response = self.cargar_desde_barra()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        pedido_carga = Pedido.objects.get(creado_por=self.usuario_barra)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(pedido_carga.mozo, self.mozo)
+        self.assertEqual(pedido_carga.creado_por, self.usuario_barra)
+        self.assertEqual(self.cuenta.mozo_responsable, self.mozo)
+        self.assertEqual(
+            list(
+                pedido_carga.detalles.order_by("producto__nombre").values_list(
+                    "producto__nombre",
+                    "cantidad",
+                    "precio_unitario",
+                    "sector_destino__nombre",
+                )
+            ),
+            [
+                ("Empanada", 2, Decimal("1800.00"), Sector.Nombre.PIZZA),
+                ("Limonada", 3, Decimal("2500.00"), Sector.Nombre.BARRA),
+            ],
+        )
+        self.assertEqual(
+            set(pedido_carga.preparaciones_sectoriales.values_list(
+                "sector__nombre",
+                flat=True,
+            )),
+            {Sector.Nombre.BARRA, Sector.Nombre.PIZZA},
+        )
+
+        aviso = AvisoCargaBarra.objects.get(pedido=pedido_carga)
+        self.assertEqual(aviso.destinatario, self.mozo)
+        self.client.force_authenticate(user=self.mozo)
+        avisos = self.client.get(self.avisos_url)
+        self.assertEqual(avisos.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(avisos.data), 1)
+        self.assertEqual(avisos.data[0]["pedido"], pedido_carga.pk)
+        self.assertEqual(
+            avisos.data[0]["mesa_identificacion"],
+            "Vereda B · Mesa 1",
+        )
+        self.assertEqual(
+            {
+                (detalle["producto_nombre"], detalle["cantidad"])
+                for detalle in avisos.data[0]["detalles"]
+            },
+            {("Limonada", 3), ("Empanada", 2)},
+        )
+
+    def test_barra_cannot_assign_responsible_to_empty_account(self):
+        response = self.cargar_desde_barra()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("responsable", str(response.data).lower())
+        self.cuenta.refresh_from_db()
+        self.assertIsNone(self.cuenta.mozo_responsable_id)
+        self.assertFalse(Pedido.objects.exists())
+        self.assertFalse(AvisoCargaBarra.objects.exists())
+
+    def test_barra_load_endpoint_is_exclusive_to_barra(self):
+        for usuario in [self.mozo, self.admin, self.cocina]:
+            with self.subTest(rol=usuario.rol):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.post(
+                    self.carga_url,
+                    {
+                        "mesa": self.mesa.pk,
+                        "cuenta": self.cuenta.pk,
+                        "detalles": [
+                            {"producto": self.bebida.pk, "cantidad": 1},
+                        ],
+                    },
+                    format="json",
+                )
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+    def test_barra_notice_list_isolated_to_authenticated_waiter(self):
+        self.crear_responsable()
+        primera_carga = self.cargar_desde_barra()
+        self.assertEqual(primera_carga.status_code, status.HTTP_201_CREATED)
+
+        otra_mesa = Mesa.objects.create(numero=1, zona=Mesa.Zona.SALON)
+        otra_cuenta = Cuenta.objects.create(mesa=otra_mesa)
+        self.crear_responsable(
+            cuenta=otra_cuenta,
+            mesa=otra_mesa,
+            mozo=self.otro_mozo,
+        )
+        segunda_carga = self.cargar_desde_barra(
+            cuenta=otra_cuenta,
+            mesa=otra_mesa,
+        )
+        self.assertEqual(segunda_carga.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.mozo)
+        avisos_mozo = self.client.get(
+            self.avisos_url,
+            {"destinatario": self.otro_mozo.pk},
+        )
+        self.assertEqual(len(avisos_mozo.data), 1)
+        self.assertEqual(
+            avisos_mozo.data[0]["mesa_identificacion"],
+            "Vereda B · Mesa 1",
+        )
+
+        self.client.force_authenticate(user=self.otro_mozo)
+        avisos_otro_mozo = self.client.get(self.avisos_url)
+        self.assertEqual(len(avisos_otro_mozo.data), 1)
+        self.assertEqual(
+            avisos_otro_mozo.data[0]["mesa_identificacion"],
+            "Salón · Mesa 1",
+        )
+
+        self.client.force_authenticate(user=self.usuario_barra)
+        self.assertEqual(
+            self.client.get(self.avisos_url).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_administrator_can_consult_barra_load_registry(self):
+        self.crear_responsable()
+        response = self.cargar_desde_barra()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        pedido_carga = Pedido.objects.get(creado_por=self.usuario_barra)
+
+        self.client.force_authenticate(user=self.admin)
+        registro = self.client.get(self.registro_url)
+
+        self.assertEqual(registro.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(registro.data), 1)
+        carga = registro.data[0]
+        self.assertEqual(carga["id"], pedido_carga.pk)
+        self.assertEqual(carga["autor_id"], self.usuario_barra.pk)
+        self.assertEqual(carga["autor_nombre"], self.usuario_barra.username)
+        self.assertEqual(carga["cuenta"], self.cuenta.pk)
+        self.assertEqual(carga["mesa_identificacion"], "Vereda B · Mesa 1")
+        self.assertEqual(carga["responsable_id"], self.mozo.pk)
+        self.assertEqual(carga["responsable_nombre"], "Ana Gomez")
+        self.assertTrue(carga["fecha_creacion"])
+        self.assertEqual(len(carga["detalles"]), 2)
+
+        User.objects.filter(pk=self.usuario_barra.pk).update(
+            rol=User.Rol.ADMINISTRADOR,
+        )
+        self.usuario_barra.refresh_from_db()
+        self.assertEqual(self.usuario_barra.rol, User.Rol.ADMINISTRADOR)
+        self.client.force_authenticate(user=self.admin)
+        registro_tras_cambio_rol = self.client.get(self.registro_url)
+        self.assertEqual(registro_tras_cambio_rol.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(registro_tras_cambio_rol.data), 1)
+        self.assertEqual(registro_tras_cambio_rol.data[0]["id"], pedido_carga.pk)
+        User.objects.filter(pk=self.usuario_barra.pk).update(
+            rol=User.Rol.BARRA,
+        )
+        self.usuario_barra.refresh_from_db()
+
+        self.client.force_authenticate(user=self.mozo)
+        self.assertEqual(
+            self.client.get(self.registro_url).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.client.force_authenticate(user=self.usuario_barra)
+        self.assertEqual(
+            self.client.get(self.registro_url).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_barra_notice_failure_rolls_back_order_and_details(self):
+        self.crear_responsable()
+        conteo_pedidos = Pedido.objects.count()
+        conteo_detalles = DetallePedido.objects.count()
+        conteo_preparaciones = PreparacionPedidoSector.objects.count()
+
+        with patch.object(
+            AvisoCargaBarra,
+            "save",
+            side_effect=RuntimeError("fallo al crear aviso"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.cargar_desde_barra()
+
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.mozo_responsable, self.mozo)
+        self.assertEqual(Pedido.objects.count(), conteo_pedidos)
+        self.assertEqual(DetallePedido.objects.count(), conteo_detalles)
+        self.assertEqual(
+            PreparacionPedidoSector.objects.count(),
+            conteo_preparaciones,
+        )
+        self.assertFalse(AvisoCargaBarra.objects.exists())
+
 
 class CuentaModelTests(TestCase):
     def setUp(self):
@@ -856,6 +1251,7 @@ class CuentaAPITests(APITestCase):
 
         self.mesa = Mesa.objects.create(numero=20)
         self.url = reverse("cuenta-create")
+        self.mesas_url = reverse("mesa-list")
         self.datos = {"mesa": self.mesa.pk}
 
     def test_waiter_can_open_account(self):
@@ -870,6 +1266,7 @@ class CuentaAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(Cuenta.objects.count(), 1)
         self.assertEqual(Cuenta.objects.get().mesa, self.mesa)
+        self.assertIsNone(Cuenta.objects.get().mozo_responsable_id)
 
     def test_non_waiter_roles_cannot_open_account(self):
         for usuario in [self.admin, self.usuario_barra, self.cocina]:
@@ -941,6 +1338,126 @@ class CuentaAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["estado"], Cuenta.Estado.ABIERTA)
+
+    def test_open_accounts_list_includes_table_identification_only(self):
+        self.client.force_authenticate(user=self.mozo)
+        segunda_mesa = Mesa.objects.create(
+            numero=21,
+            zona=Mesa.Zona.VEREDA_A,
+        )
+        cuenta_abierta = Cuenta.objects.create(mesa=segunda_mesa)
+        cuenta_abierta.mozo_responsable = self.mozo
+        cuenta_abierta.save(update_fields=["mozo_responsable"])
+        cuenta_cerrada = Cuenta.objects.create(mesa=self.mesa)
+        cuenta_cerrada.cerrar()
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [cuenta["id"] for cuenta in response.data],
+            [cuenta_abierta.pk],
+        )
+        self.assertEqual(
+            response.data[0]["mesa_identificacion"],
+            "Vereda A · Mesa 21",
+        )
+        self.assertEqual(response.data[0]["mesa"], segunda_mesa.pk)
+        self.assertEqual(
+            response.data[0]["mozo_responsable_id"],
+            self.mozo.pk,
+        )
+        self.assertEqual(
+            response.data[0]["mozo_responsable_nombre"],
+            self.mozo.username,
+        )
+        self.mozo.first_name = "Ana"
+        self.mozo.last_name = "Gomez"
+        self.mozo.save(update_fields=["first_name", "last_name"])
+        response_con_nombre = self.client.get(self.url)
+        self.assertEqual(
+            response_con_nombre.data[0]["mozo_responsable_nombre"],
+            "Ana Gomez",
+        )
+
+    def test_mesa_list_returns_identification_ordered_by_zone_and_number(self):
+        self.client.force_authenticate(user=self.mozo)
+        salon_3 = Mesa.objects.create(numero=3, zona=Mesa.Zona.SALON)
+        vereda_a_3 = Mesa.objects.create(numero=3, zona=Mesa.Zona.VEREDA_A)
+        vereda_b_3 = Mesa.objects.create(numero=3, zona=Mesa.Zona.VEREDA_B)
+
+        response = self.client.get(self.mesas_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [(mesa["zona"], mesa["numero"]) for mesa in response.data],
+            [
+                (Mesa.Zona.SALON, 3),
+                (Mesa.Zona.SALON, 20),
+                (Mesa.Zona.VEREDA_A, 3),
+                (Mesa.Zona.VEREDA_B, 3),
+            ],
+        )
+        self.assertEqual(
+            [mesa["identificacion"] for mesa in response.data],
+            [
+                "Salón · Mesa 3",
+                "Salón · Mesa 20",
+                "Vereda A · Mesa 3",
+                "Vereda B · Mesa 3",
+            ],
+        )
+        self.assertEqual(
+            [mesa["id"] for mesa in response.data],
+            [salon_3.pk, self.mesa.pk, vereda_a_3.pk, vereda_b_3.pk],
+        )
+
+    def test_mesa_and_account_get_lists_allow_mozo_and_barra(self):
+        for usuario in [self.mozo, self.usuario_barra]:
+            with self.subTest(rol=usuario.rol):
+                self.client.force_authenticate(user=usuario)
+                self.assertEqual(
+                    self.client.get(self.mesas_url).status_code,
+                    status.HTTP_200_OK,
+                )
+                self.assertEqual(
+                    self.client.get(self.url).status_code,
+                    status.HTTP_200_OK,
+                )
+
+    def test_account_post_remains_mozo_only_when_barra_can_get_lists(self):
+        self.client.force_authenticate(user=self.usuario_barra)
+        self.assertEqual(
+            self.client.get(self.mesas_url).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.get(self.url).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.post(self.url, self.datos, format="json").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self.client.force_authenticate(user=self.admin)
+        for url in [self.mesas_url, self.url]:
+            with self.subTest(url=url):
+                self.assertEqual(
+                    self.client.get(url).status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+        self.client.force_authenticate(user=None)
+        for url in [self.mesas_url, self.url]:
+            with self.subTest(url=url):
+                self.assertIn(
+                    self.client.get(url).status_code,
+                    {
+                        status.HTTP_401_UNAUTHORIZED,
+                        status.HTTP_403_FORBIDDEN,
+                    },
+                )
 
     def test_account_can_be_reopened_after_closing(self):
         self.client.force_authenticate(user=self.mozo)
@@ -1483,8 +2000,14 @@ class RetiroPedidoAPITests(APITestCase):
         self.control_url = reverse("barra-retiros-list")
         self.avisos_url = reverse("aviso-retiro-list")
 
-    def crear_pedido(self, sectores, numero_mesa, mozo=None):
-        mesa = Mesa.objects.create(numero=numero_mesa)
+    def crear_pedido(
+        self,
+        sectores,
+        numero_mesa,
+        mozo=None,
+        zona=Mesa.Zona.SALON,
+    ):
+        mesa = Mesa.objects.create(numero=numero_mesa, zona=zona)
         cuenta = Cuenta.objects.create(mesa=mesa)
         pedido = Pedido.objects.create(
             mesa=mesa,
@@ -1544,7 +2067,11 @@ class RetiroPedidoAPITests(APITestCase):
         return self.client.post(self.confirmacion_url(pedido), format="json")
 
     def test_barra_only_enables_retiro_when_its_preparation_becomes_ready(self):
-        pedido, preparaciones = self.crear_pedido([self.barra], 47)
+        pedido, preparaciones = self.crear_pedido(
+            [self.barra],
+            47,
+            zona=Mesa.Zona.VEREDA_A,
+        )
 
         self.marcar_lista(preparaciones[Sector.Nombre.BARRA])
 
@@ -1553,7 +2080,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertIsNotNone(pedido.retiro_habilitado_en)
         self.assertEqual(pedido.retiro_habilitado_por, self.usuario_barra)
         self.assertEqual(aviso.destinatario, self.mozo)
-        self.assertEqual(aviso.mensaje, "Mesa 47")
+        self.assertEqual(aviso.mensaje, "Vereda A · Mesa 47")
         self.assertNotEqual(pedido.mesa_id, pedido.mesa.numero)
 
     def test_kitchen_only_order_waits_for_bar_confirmation(self):
@@ -1570,6 +2097,8 @@ class RetiroPedidoAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data[0]["mesa"], 48)
+        self.assertEqual(response.data[0]["zona"], Mesa.Zona.SALON)
+        self.assertEqual(response.data[0]["identificacion"], "Salón · Mesa 48")
         self.assertEqual(response.data[0]["pedido"], pedido.pk)
         self.assertEqual(response.data[0]["mozo_id"], self.mozo.pk)
         self.assertEqual(response.data[0]["mozo_nombre"], "Ana Gomez")
@@ -1603,7 +2132,10 @@ class RetiroPedidoAPITests(APITestCase):
 
         response = self.confirmar_retiro(pedido)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(AvisoRetiro.objects.get(pedido=pedido).mensaje, "Mesa 49")
+        self.assertEqual(
+            AvisoRetiro.objects.get(pedido=pedido).mensaje,
+            "Salón · Mesa 49",
+        )
 
     def test_pizza_and_platos_must_both_be_ready_before_confirmation(self):
         pedido, preparaciones = self.crear_pedido(
@@ -1736,13 +2268,13 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["pedido"], primer_pedido.pk)
-        self.assertEqual(response.data[0]["mensaje"], "Mesa 57")
+        self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 57")
 
         self.client.force_authenticate(user=self.otro_mozo)
         response = self.client.get(self.avisos_url)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["pedido"], segundo_pedido.pk)
-        self.assertEqual(response.data[0]["mensaje"], "Mesa 58")
+        self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 58")
 
     def test_bar_control_and_confirmation_are_exclusive_to_barra(self):
         pedido, preparaciones = self.crear_pedido([self.pizza], 59)
@@ -1768,4 +2300,3 @@ class RetiroPedidoAPITests(APITestCase):
             self.client.get(self.avisos_url).status_code,
             status.HTTP_403_FORBIDDEN,
         )
-

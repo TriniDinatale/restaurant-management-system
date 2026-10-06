@@ -10,13 +10,33 @@ from django.db.models import Q
 from django.utils import timezone
 
 class Mesa(models.Model):
-    numero = models.PositiveIntegerField(unique=True)
+    class Zona(models.TextChoices):
+        SALON = "SALON", "Salón"
+        VEREDA_A = "VEREDA_A", "Vereda A"
+        VEREDA_B = "VEREDA_B", "Vereda B"
+
+    numero = models.PositiveIntegerField()
+    zona = models.CharField(
+        max_length=10,
+        choices=Zona.choices,
+        default=Zona.SALON,
+    )
 
     class Meta:
-        ordering = ["numero"]
+        ordering = ["zona", "numero"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["zona", "numero"],
+                name="unique_mesa_zona_numero",
+            ),
+        ]
+
+    @property
+    def identificacion(self):
+        return f"{self.get_zona_display()} · Mesa {self.numero}"
 
     def __str__(self):
-        return f"Mesa {self.numero}"
+        return self.identificacion
 
 class Cuenta(models.Model):
     class Estado(models.TextChoices):
@@ -27,6 +47,14 @@ class Cuenta(models.Model):
         Mesa,
         on_delete=models.PROTECT,
         related_name="cuentas",
+    )
+
+    mozo_responsable = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="cuentas_responsable",
     )
 
     estado = models.CharField(
@@ -81,6 +109,14 @@ class Pedido(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="pedidos",
+    )
+
+    creado_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="pedidos_creados",
     )
 
     fecha_creacion = models.DateTimeField(
@@ -189,12 +225,31 @@ class Pedido(models.Model):
         aviso = AvisoRetiro.objects.create(
             pedido=pedido,
             destinatario=pedido.mozo,
-            mensaje=f"Mesa {pedido.mesa.numero}",
+            mensaje=pedido.mesa.identificacion,
         )
 
         self.retiro_habilitado_en = fecha_habilitacion
         self.retiro_habilitado_por = usuario
         return aviso
+
+
+class AvisoCargaBarra(models.Model):
+    pedido = models.OneToOneField(
+        Pedido,
+        on_delete=models.CASCADE,
+        related_name="aviso_carga_barra",
+    )
+
+    destinatario = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="avisos_carga_barra",
+    )
+
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-fecha_creacion"]
 
 
 class DetallePedido(models.Model):

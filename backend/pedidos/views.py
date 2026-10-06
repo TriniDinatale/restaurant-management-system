@@ -3,20 +3,39 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, serializers
+from rest_framework.permissions import BasePermission, SAFE_METHODS
 from rest_framework.response import Response
 
-from usuarios.models import Sector
-from usuarios.permissions import IsBarra, IsMozo, IsPreparador
+from usuarios.models import Sector, User
+from usuarios.permissions import IsAdministrador, IsBarra, IsMozo, IsPreparador
 
-from .models import AvisoRetiro, Pedido, PreparacionPedidoSector
+from .models import (
+    AvisoCargaBarra,
+    AvisoRetiro,
+    Cuenta,
+    Mesa,
+    Pedido,
+    PreparacionPedidoSector,
+)
 from .serializers import (
+    AvisoCargaBarraSerializer,
     AvisoRetiroSerializer,
     ControlRetiroBarraSerializer,
     CuentaSerializer,
+    RegistroCargaBarraSerializer,
+    MesaSerializer,
     PedidoSerializer,
     PreparacionPedidoSectorSerializer,
     TransicionPreparacionSerializer,
 )
+
+
+class IsMozoOrBarra(BasePermission):
+    def has_permission(self, request, view):
+        return (
+            request.user.is_authenticated
+            and request.user.rol in {User.Rol.MOZO, User.Rol.BARRA}
+        )
 
 
 class PedidoCreateView(generics.CreateAPIView):
@@ -25,9 +44,67 @@ class PedidoCreateView(generics.CreateAPIView):
     queryset = Pedido.objects.all()
 
 
-class CuentaCreateView(generics.CreateAPIView):
+class MesaListView(generics.ListAPIView):
+    serializer_class = MesaSerializer
+    permission_classes = [IsMozoOrBarra]
+    queryset = Mesa.objects.all().order_by("zona", "numero")
+
+
+class CuentaListCreateView(generics.ListCreateAPIView):
     serializer_class = CuentaSerializer
+
+    def get_queryset(self):
+        return (
+            Cuenta.objects.filter(estado=Cuenta.Estado.ABIERTA)
+            .select_related("mesa", "mozo_responsable")
+        )
+
+    def get_permissions(self):
+        if self.request.method in SAFE_METHODS:
+            return [IsMozoOrBarra()]
+        return [IsMozo()]
+
+
+class BarraPedidoCreateView(generics.CreateAPIView):
+    serializer_class = PedidoSerializer
+    permission_classes = [IsBarra]
+
+
+class AvisosCargaBarraListView(generics.ListAPIView):
+    serializer_class = AvisoCargaBarraSerializer
     permission_classes = [IsMozo]
+
+    def get_queryset(self):
+        return (
+            AvisoCargaBarra.objects.filter(
+                destinatario=self.request.user,
+            )
+            .select_related("pedido", "pedido__mesa")
+            .prefetch_related(
+                "pedido__detalles__producto",
+                "pedido__detalles__sector_destino",
+            )
+        )
+
+
+class RegistroCargaBarraListView(generics.ListAPIView):
+    serializer_class = RegistroCargaBarraSerializer
+    permission_classes = [IsAdministrador]
+
+    def get_queryset(self):
+        return (
+            Pedido.objects.filter(aviso_carga_barra__isnull=False)
+            .select_related(
+                "creado_por",
+                "cuenta",
+                "cuenta__mozo_responsable",
+                "mesa",
+            )
+            .prefetch_related(
+                "detalles__producto",
+                "detalles__sector_destino",
+            )
+        )
 
 
 class PreparacionSectorMixin:
