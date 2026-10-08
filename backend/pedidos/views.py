@@ -25,6 +25,7 @@ from .serializers import (
     RegistroCargaBarraSerializer,
     MesaSerializer,
     PedidoSerializer,
+    PedidoPorMesaSerializer,
     PreparacionPedidoSectorSerializer,
     TransicionPreparacionSerializer,
 )
@@ -40,6 +41,11 @@ class IsMozoOrBarra(BasePermission):
 
 class PedidoCreateView(generics.CreateAPIView):
     serializer_class = PedidoSerializer
+    permission_classes = [IsMozo]
+    queryset = Pedido.objects.all()
+
+class PedidoPorMesaCreateView(generics.CreateAPIView):
+    serializer_class = PedidoPorMesaSerializer
     permission_classes = [IsMozo]
     queryset = Pedido.objects.all()
 

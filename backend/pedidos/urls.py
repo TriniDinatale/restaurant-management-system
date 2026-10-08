@@ -3,6 +3,7 @@ from django.urls import path
 
 from .views import (
     PedidoCreateView,
+    PedidoPorMesaCreateView,
     CuentaListCreateView,
     AvisosRetiroListView,
     ConfirmarRetiroView,
@@ -23,6 +24,11 @@ urlpatterns = [
     ),
     
     path("mesas/", MesaListView.as_view(), name="mesa-list"),
+    path(
+        "mesas/cargas/",
+        PedidoPorMesaCreateView.as_view(),
+        name="pedido-mesa-create",
+    ),
     path(
         "barra/cargas/",
         BarraPedidoCreateView.as_view(),

@@ -295,6 +295,7 @@ class PedidoAPITests(APITestCase):
         )
 
         self.url = reverse("pedido-create")
+        self.mesa_pedido_url = reverse("pedido-mesa-create")
 
         self.datos = {
             "mesa": self.mesa.pk,
@@ -310,6 +311,183 @@ class PedidoAPITests(APITestCase):
                 },
             ],
         }
+
+    def enviar_por_mesa(self, mesa, mozo=None, producto=None):
+        self.client.force_authenticate(user=mozo or self.mozo)
+        return self.client.post(
+            self.mesa_pedido_url,
+            {
+                "mesa": mesa.pk,
+                "detalles": [
+                    {
+                        "producto": (producto or self.producto).pk,
+                        "cantidad": 1,
+                    },
+                ],
+            },
+            format="json",
+        )
+
+    def test_first_table_order_opens_account_and_assigns_responsible(self):
+        mesa = Mesa.objects.create(numero=31)
+
+        response = self.enviar_por_mesa(mesa)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        cuenta = Cuenta.objects.get(mesa=mesa, estado=Cuenta.Estado.ABIERTA)
+        pedido = Pedido.objects.get(mesa=mesa)
+        self.assertEqual(pedido.cuenta, cuenta)
+        self.assertEqual(cuenta.mozo_responsable, self.mozo)
+        self.assertEqual(pedido.mozo, self.mozo)
+        self.assertEqual(pedido.creado_por, self.mozo)
+
+    def test_later_table_order_uses_same_open_account(self):
+        mesa = Mesa.objects.create(numero=32)
+
+        first = self.enviar_por_mesa(mesa)
+        second = self.enviar_por_mesa(mesa)
+
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        self.assertEqual(Cuenta.objects.filter(mesa=mesa).count(), 1)
+        cuenta = Cuenta.objects.get(mesa=mesa)
+        self.assertEqual(cuenta.pedidos.count(), 2)
+        self.assertEqual(cuenta.mozo_responsable, self.mozo)
+
+    def test_table_order_uses_account_opened_explicitly(self):
+        mesa = Mesa.objects.create(numero=38)
+        self.client.force_authenticate(user=self.mozo)
+        opened = self.client.post(
+            reverse("cuenta-create"),
+            {"mesa": mesa.pk},
+            format="json",
+        )
+
+        response = self.enviar_por_mesa(mesa)
+
+        self.assertEqual(opened.status_code, status.HTTP_201_CREATED, opened.data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        cuenta = Cuenta.objects.get(mesa=mesa, estado=Cuenta.Estado.ABIERTA)
+        pedido = Pedido.objects.get(mesa=mesa)
+        self.assertEqual(Cuenta.objects.filter(mesa=mesa).count(), 1)
+        self.assertEqual(pedido.cuenta_id, cuenta.pk)
+        self.assertEqual(cuenta.mozo_responsable, self.mozo)
+
+    def test_new_occupancy_uses_new_account_without_reusing_history(self):
+        mesa = Mesa.objects.create(numero=33)
+        first = self.enviar_por_mesa(mesa)
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        first_pedido = Pedido.objects.get(mesa=mesa)
+        first_cuenta = first_pedido.cuenta
+        aviso_historico = AvisoRetiro.objects.create(
+            pedido=first_pedido,
+            destinatario=self.mozo,
+            mensaje=mesa.identificacion,
+        )
+        aviso_carga_historico = AvisoCargaBarra.objects.create(
+            pedido=first_pedido,
+            destinatario=self.mozo,
+        )
+        first_cuenta.cerrar()
+
+        otro_mozo = User.objects.create_user(
+            username="nuevo_responsable_mesa",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        second = self.enviar_por_mesa(mesa, mozo=otro_mozo)
+
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        second_pedido = Pedido.objects.exclude(pk=first_pedido.pk).get(mesa=mesa)
+        second_cuenta = second_pedido.cuenta
+        self.assertNotEqual(first_cuenta.pk, second_cuenta.pk)
+        self.assertEqual(second_cuenta.mozo_responsable, otro_mozo)
+        self.assertEqual(list(first_cuenta.pedidos.values_list("pk", flat=True)), [first_pedido.pk])
+        self.assertEqual(list(second_cuenta.pedidos.values_list("pk", flat=True)), [second_pedido.pk])
+        aviso_historico.refresh_from_db()
+        self.assertEqual(aviso_historico.pedido, first_pedido)
+        self.assertEqual(aviso_historico.destinatario, self.mozo)
+        aviso_carga_historico.refresh_from_db()
+        self.assertEqual(aviso_carga_historico.pedido, first_pedido)
+        self.assertEqual(aviso_carga_historico.destinatario, self.mozo)
+
+    def test_new_table_order_rolls_back_account_order_and_preparations_on_detail_failure(self):
+        mesa = Mesa.objects.create(numero=34)
+        self.client.force_authenticate(user=self.mozo)
+
+        with patch(
+            "pedidos.serializers.DetallePedido.objects.create",
+            side_effect=RuntimeError("Fallo simulado al crear detalle."),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    self.mesa_pedido_url,
+                    {
+                        "mesa": mesa.pk,
+                        "detalles": [
+                            {"producto": self.producto.pk, "cantidad": 1},
+                        ],
+                    },
+                    format="json",
+                )
+
+        self.assertFalse(Cuenta.objects.filter(mesa=mesa).exists())
+        self.assertFalse(Pedido.objects.filter(mesa=mesa).exists())
+        self.assertFalse(PreparacionPedidoSector.objects.filter(pedido__mesa=mesa).exists())
+
+    def test_table_order_endpoint_is_exclusive_to_waiters(self):
+        mesa = Mesa.objects.create(numero=35)
+        for usuario in [self.admin, self.usuario_barra, self.cocina]:
+            with self.subTest(rol=usuario.rol):
+                response = self.enviar_por_mesa(mesa, mozo=usuario)
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.assertFalse(Cuenta.objects.filter(mesa=mesa).exists())
+        self.assertFalse(Pedido.objects.filter(mesa=mesa).exists())
+
+    def test_anonymous_user_cannot_use_table_order_endpoint(self):
+        mesa = Mesa.objects.create(numero=37)
+
+        response = self.client.post(
+            self.mesa_pedido_url,
+            {
+                "mesa": mesa.pk,
+                "detalles": [
+                    {"producto": self.producto.pk, "cantidad": 1},
+                ],
+            },
+            format="json",
+        )
+
+        self.assertIn(
+            response.status_code,
+            {
+                status.HTTP_401_UNAUTHORIZED,
+                status.HTTP_403_FORBIDDEN,
+            },
+        )
+        self.assertFalse(Cuenta.objects.filter(mesa=mesa).exists())
+        self.assertFalse(Pedido.objects.filter(mesa=mesa).exists())
+
+    def test_other_waiter_cannot_send_to_account_with_existing_responsible(self):
+        mesa = Mesa.objects.create(numero=36)
+        first = self.enviar_por_mesa(mesa)
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        other = User.objects.create_user(
+            username="otro_mozo_nueva_ruta",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+
+        rejected = self.enviar_por_mesa(mesa, mozo=other)
+
+        self.assertEqual(rejected.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("responsable", str(rejected.data).lower())
+        cuenta = Cuenta.objects.get(mesa=mesa, estado=Cuenta.Estado.ABIERTA)
+        self.assertEqual(cuenta.mozo_responsable, self.mozo)
+        self.assertEqual(cuenta.pedidos.count(), 1)
 
     def test_anonymous_user_cannot_create_order(self):
         response = self.client.post(

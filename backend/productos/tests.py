@@ -191,6 +191,25 @@ class ProductoAPITests(APITestCase):
             ids,
         )
 
+    def test_products_with_inactive_destination_sector_are_not_listed(self):
+        producto_sector_inactivo = Producto.objects.create(
+            nombre="Pizza de sector inactivo",
+            precio="11000.00",
+            categoria=self.categoria_activa,
+            sector_destino=self.barra,
+            activo=True,
+        )
+        self.barra.activo = False
+        self.barra.save(update_fields=["activo"])
+        self.client.force_authenticate(user=self.mozo)
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [producto["id"] for producto in response.data]
+        self.assertIn(self.producto_activo.pk, ids)
+        self.assertNotIn(producto_sector_inactivo.pk, ids)
+
     def test_authenticated_user_can_retrieve_product(self):
         self.client.force_authenticate(user=self.mozo)
 
@@ -500,6 +519,24 @@ class ProductoAdministracionAPITests(APITestCase):
         ids = [producto["id"] for producto in response.data]
 
         self.assertIn(self.producto.pk, ids)
+
+    def test_admin_can_list_products_with_inactive_sector_when_requesting_all(self):
+        producto_sector_inactivo = Producto.objects.create(
+            nombre="Producto de sector inactivo",
+            precio="11000.00",
+            categoria=self.categoria,
+            sector_destino=self.pizza,
+            activo=True,
+        )
+        self.pizza.activo = False
+        self.pizza.save(update_fields=["activo"])
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.get(self.list_url, {"todos": "true"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [producto["id"] for producto in response.data]
+        self.assertIn(producto_sector_inactivo.pk, ids)
 
     def test_non_admin_cannot_list_inactive_products(self):
         self.producto.activo = False

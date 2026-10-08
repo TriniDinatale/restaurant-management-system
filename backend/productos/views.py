@@ -78,6 +78,7 @@ class ProductoListView(generics.ListCreateAPIView):
             return queryset.filter(
                 activo=True,
                 categoria__activo=True,
+                sector_destino__activo=True,
             )
 
         return queryset

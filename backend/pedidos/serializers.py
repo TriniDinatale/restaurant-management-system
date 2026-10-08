@@ -42,6 +42,86 @@ class DetallePedidoSerializer(serializers.ModelSerializer):
         ]
 
 
+def crear_pedido_para_cuenta(cuenta, mesa, detalles_data, usuario):
+    if cuenta.estado != Cuenta.Estado.ABIERTA:
+        raise serializers.ValidationError(
+            {"cuenta": "No se pueden agregar pedidos a una cuenta cerrada."}
+        )
+    if cuenta.mesa_id != mesa.pk:
+        raise serializers.ValidationError(
+            {"mesa": "La mesa no coincide con la cuenta indicada."}
+        )
+
+    if usuario.rol == User.Rol.MOZO:
+        if cuenta.mozo_responsable_id is None:
+            if cuenta.pedidos.exists():
+                raise serializers.ValidationError(
+                    {
+                        "cuenta": (
+                            "La cuenta histórica tiene pedidos pero no "
+                            "responsable. Debe resolverse "
+                            "administrativamente antes de continuar."
+                        )
+                    }
+                )
+            cuenta.mozo_responsable = usuario
+            cuenta.save(update_fields=["mozo_responsable"])
+        elif cuenta.mozo_responsable_id != usuario.pk:
+            raise serializers.ValidationError(
+                {
+                    "cuenta": (
+                        "Solo el mozo responsable de esta cuenta puede "
+                        "enviar pedidos."
+                    )
+                }
+            )
+    elif cuenta.mozo_responsable_id is None:
+        raise serializers.ValidationError(
+            {
+                "cuenta": (
+                    "Barra solo puede cargar pedidos a una cuenta "
+                    "con responsable."
+                )
+            }
+        )
+
+    responsable = cuenta.mozo_responsable
+    pedido = Pedido.objects.create(
+        mesa=mesa,
+        cuenta=cuenta,
+        mozo=responsable,
+        creado_por=usuario,
+    )
+
+    for detalle_data in detalles_data:
+        DetallePedido.objects.create(
+            pedido=pedido,
+            **detalle_data,
+        )
+
+    sectores_ids = pedido.detalles.values_list(
+        "sector_destino_id",
+        flat=True,
+    ).distinct()
+    PreparacionPedidoSector.objects.bulk_create(
+        [
+            PreparacionPedidoSector(
+                pedido=pedido,
+                sector_id=sector_id,
+            )
+            for sector_id in sectores_ids
+        ]
+    )
+
+    if usuario.rol == User.Rol.BARRA:
+        AvisoCargaBarra.objects.create(
+            pedido=pedido,
+            destinatario=responsable,
+        )
+
+    return pedido
+
+
 class PedidoSerializer(serializers.ModelSerializer):
     detalles = DetallePedidoSerializer(
         many=True,
@@ -115,6 +195,13 @@ class PedidoSerializer(serializers.ModelSerializer):
         mesa_enviada = validated_data.pop("mesa")
 
         try:
+            mesa = Mesa.objects.select_for_update().get(pk=mesa_enviada.pk)
+        except Mesa.DoesNotExist as exc:
+            raise serializers.ValidationError(
+                {"mesa": "La mesa indicada ya no existe."}
+            ) from exc
+
+        try:
             cuenta = (
                 Cuenta.objects.select_for_update(of=("self",))
                 .select_related("mesa", "mozo_responsable")
@@ -125,83 +212,56 @@ class PedidoSerializer(serializers.ModelSerializer):
                 {"cuenta": "La cuenta indicada ya no existe."}
             ) from exc
 
-        if cuenta.estado != Cuenta.Estado.ABIERTA:
-            raise serializers.ValidationError(
-                {"cuenta": "No se pueden agregar pedidos a una cuenta cerrada."}
-            )
-        if cuenta.mesa_id != mesa_enviada.pk:
-            raise serializers.ValidationError(
-                {"mesa": "La mesa no coincide con la cuenta indicada."}
-            )
-
-        if usuario.rol == User.Rol.MOZO:
-            if cuenta.mozo_responsable_id is None:
-                if cuenta.pedidos.exists():
-                    raise serializers.ValidationError(
-                        {
-                            "cuenta": (
-                                "La cuenta histórica tiene pedidos pero no "
-                                "responsable. Debe resolverse "
-                                "administrativamente antes de continuar."
-                            )
-                        }
-                    )
-                cuenta.mozo_responsable = usuario
-                cuenta.save(update_fields=["mozo_responsable"])
-            elif cuenta.mozo_responsable_id != usuario.pk:
-                raise serializers.ValidationError(
-                    {
-                        "cuenta": (
-                            "Solo el mozo responsable de esta cuenta puede "
-                            "enviar pedidos."
-                        )
-                    }
-                )
-        elif cuenta.mozo_responsable_id is None:
-            raise serializers.ValidationError(
-                {
-                    "cuenta": (
-                        "Barra solo puede cargar pedidos a una cuenta "
-                        "con responsable."
-                    )
-                }
-            )
-
-        responsable = cuenta.mozo_responsable
-        pedido = Pedido.objects.create(
-            mesa=mesa_enviada,
+        return crear_pedido_para_cuenta(
             cuenta=cuenta,
-            mozo=responsable,
-            creado_por=usuario,
+            mesa=mesa,
+            detalles_data=detalles_data,
+            usuario=usuario,
         )
 
-        for detalle_data in detalles_data:
-            DetallePedido.objects.create(
-                pedido=pedido,
-                **detalle_data,
-            )
 
-        sectores_ids = pedido.detalles.values_list(
-            "sector_destino_id",
-            flat=True,
-        ).distinct()
-        PreparacionPedidoSector.objects.bulk_create(
-            [
-                PreparacionPedidoSector(
-                    pedido=pedido,
-                    sector_id=sector_id,
-                )
-                for sector_id in sectores_ids
-            ]
+class PedidoPorMesaSerializer(serializers.Serializer):
+    mesa = serializers.PrimaryKeyRelatedField(queryset=Mesa.objects.all())
+    detalles = DetallePedidoSerializer(many=True)
+
+    def validate_detalles(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                "El pedido debe contener al menos un producto."
+            )
+        return value
+
+    @transaction.atomic
+    def create(self, validated_data):
+        mesa_enviada = validated_data["mesa"]
+        detalles_data = validated_data["detalles"]
+        usuario = self.context["request"].user
+
+        try:
+            mesa = Mesa.objects.select_for_update().get(pk=mesa_enviada.pk)
+        except Mesa.DoesNotExist as exc:
+            raise serializers.ValidationError(
+                {"mesa": "La mesa indicada ya no existe."}
+            ) from exc
+
+        cuenta = (
+            Cuenta.objects.select_for_update(of=("self",))
+            .select_related("mesa", "mozo_responsable")
+            .filter(mesa=mesa, estado=Cuenta.Estado.ABIERTA)
+            .first()
+        )
+        if cuenta is None:
+            cuenta = Cuenta.objects.create(mesa=mesa)
+
+        return crear_pedido_para_cuenta(
+            cuenta=cuenta,
+            mesa=mesa,
+            detalles_data=detalles_data,
+            usuario=usuario,
         )
 
-        if usuario.rol == User.Rol.BARRA:
-            AvisoCargaBarra.objects.create(
-                pedido=pedido,
-                destinatario=responsable,
-            )
-
-        return pedido
+    def to_representation(self, instance):
+        return PedidoSerializer(instance, context=self.context).data
 
 
 class CuentaSerializer(serializers.ModelSerializer):
@@ -252,8 +312,25 @@ class CuentaSerializer(serializers.ModelSerializer):
         return mesa
 
     def create(self, validated_data):
+        mesa_enviada = validated_data["mesa"]
         try:
             with transaction.atomic():
+                try:
+                    mesa = Mesa.objects.select_for_update().get(
+                        pk=mesa_enviada.pk,
+                    )
+                except Mesa.DoesNotExist as exc:
+                    raise serializers.ValidationError(
+                        {"mesa": "La mesa indicada ya no existe."}
+                    ) from exc
+
+                if Cuenta.objects.filter(
+                    mesa=mesa,
+                    estado=Cuenta.Estado.ABIERTA,
+                ).exists():
+                    raise serializers.ValidationError(
+                        {"mesa": "Esta mesa ya tiene una cuenta abierta."}
+                    )
                 return super().create(validated_data)
         except IntegrityError as exc:
             constraint_name = getattr(

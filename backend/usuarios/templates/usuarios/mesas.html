@@ -19,7 +19,7 @@
         <div>
             <p class="eyebrow">OPERACIÓN</p>
             <h1>Mesas</h1>
-            <p class="intro">Estado de las cuentas abiertas por zona.</p>
+            <p class="intro">Seleccioná una mesa para cargar un pedido.</p>
         </div>
         <button id="refresh-button" class="button button-secondary" type="button">
             Actualizar datos
@@ -29,4 +29,56 @@
     <p id="loading-message" class="loading-message" role="status">Cargando mesas y cuentas…</p>
     <div id="zones" class="zones" aria-live="polite"></div>
 </main>
+<div id="order-overlay" class="order-overlay" hidden>
+    <section
+        id="order-panel"
+        class="order-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="order-title"
+        aria-describedby="order-context"
+    >
+        <header class="order-header">
+            <div>
+                <p class="eyebrow">NUEVO PEDIDO</p>
+                <h1 id="order-title">Cargar pedido</h1>
+                <p id="order-context" class="intro"></p>
+            </div>
+            <button id="order-close" class="button button-quiet" type="button"
+                    aria-label="Cerrar formulario">Cerrar</button>
+        </header>
+        <div id="order-message" class="message" role="alert" aria-live="polite" hidden></div>
+        <form id="order-form">
+            <div class="order-layout">
+                <section class="catalog-section" aria-labelledby="catalog-title">
+                    <div class="section-heading">
+                        <h2 id="catalog-title">Productos</h2>
+                        <label class="search-label" for="product-search">Buscar por nombre</label>
+                        <input id="product-search" type="search" autocomplete="off"
+                               placeholder="Ej.: limonada">
+                    </div>
+                    <p id="catalog-loading" class="loading-message" role="status" hidden>
+                        Cargando productos…
+                    </p>
+                    <div id="product-catalog" class="product-catalog"></div>
+                </section>
+                <section class="summary-section" aria-labelledby="summary-title">
+                    <div class="section-heading">
+                        <h2 id="summary-title">Resumen</h2>
+                    </div>
+                    <div id="order-summary" class="order-summary"></div>
+                    <p id="order-total" class="order-total">Total estimado: $0,00</p>
+                    <div class="order-actions">
+                        <button id="order-cancel" class="button button-quiet" type="button">
+                            Cancelar
+                        </button>
+                        <button id="order-submit" class="button button-primary" type="submit" disabled>
+                            Enviar pedido
+                        </button>
+                    </div>
+                </section>
+            </div>
+        </form>
+    </section>
+</div>
 {% endblock %}

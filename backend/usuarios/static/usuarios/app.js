@@ -7,6 +7,9 @@ const API = {
     me: "/api/usuarios/me/",
     mesas: "/api/pedidos/mesas/",
     cuentas: "/api/pedidos/cuentas/",
+    productos: "/api/productos/",
+    pedidosPorMesa: "/api/pedidos/mesas/cargas/",
+    cargasBarra: "/api/pedidos/barra/cargas/",
 };
 
 const ZONES = [
@@ -24,7 +27,53 @@ const ROLE_LABELS = {
 
 let csrfToken = "";
 let currentUser = null;
-let openingTableId = null;
+let orderContext = null;
+let orderProducts = [];
+let selectedProducts = new Map();
+let orderPending = false;
+let orderCatalogLoaded = false;
+const uncertainOrderAccounts = new Set();
+
+function uncertainOrdersStorageKey(userId) {
+    return `restaurant:uncertain-order-mesas:${userId}`;
+}
+
+function restoreUncertainOrderMesas(userId) {
+    uncertainOrderAccounts.clear();
+    try {
+        const savedIds = JSON.parse(
+            sessionStorage.getItem(uncertainOrdersStorageKey(userId)) || "[]",
+        );
+        if (!Array.isArray(savedIds)) {
+            throw new Error("El registro local de envíos inciertos tiene un formato inválido.");
+        }
+        for (const id of savedIds) {
+            if (Number.isSafeInteger(id) && id > 0) {
+                uncertainOrderAccounts.add(id);
+            }
+        }
+        return "";
+    } catch (error) {
+        return error.message
+            || "No se pudieron recuperar los bloqueos de envíos inciertos.";
+    }
+}
+
+function markOrderUncertain(mesaId) {
+    uncertainOrderAccounts.add(mesaId);
+    try {
+        sessionStorage.setItem(
+            uncertainOrdersStorageKey(currentUser.id),
+            JSON.stringify([...uncertainOrderAccounts]),
+        );
+    } catch {
+        showMessage(
+            "El envío no pudo confirmarse y quedó bloqueado en esta página, "
+                + "pero el navegador no pudo guardar el bloqueo para recargas.",
+            true,
+        );
+    }
+}
 
 function showMessage(text, isError = false) {
     const message = document.getElementById("page-message");
@@ -37,17 +86,25 @@ function showMessage(text, isError = false) {
 function formatApiError(data, fallback) {
     if (!data) return fallback;
     if (typeof data === "string") return data;
-    if (Array.isArray(data)) return data.map(String).join(" ");
+    if (Array.isArray(data)) {
+        return data
+            .map((item) => formatApiError(item, ""))
+            .filter(Boolean)
+            .join(" ") || fallback;
+    }
     if (typeof data.detail === "string") return data.detail;
-    return Object.entries(data)
+    const messages = Object.entries(data)
         .flatMap(([field, messages]) => {
             const values = Array.isArray(messages) ? messages : [messages];
             return values.map((message) => {
                 const label = field === "mesa" ? "Mesa" : field;
-                return `${label}: ${String(message)}`;
+                const detail = formatApiError(message, "");
+                return detail ? `${label}: ${detail}` : "";
             });
         })
+        .filter(Boolean)
         .join(" ");
+    return messages || fallback;
 }
 
 async function readJson(response) {
@@ -191,35 +248,376 @@ function makeElement(tag, className, text) {
     return element;
 }
 
-function renderTableCard(mesa, cuenta) {
-    const card = makeElement("article", "table-card");
-    const heading = makeElement("div", "table-card-heading");
-    heading.append(makeElement("h2", "", mesa.identificacion));
-    const hasAccount = Boolean(cuenta);
-    heading.append(
-        makeElement(
-            "span",
-            `status-label${hasAccount ? "" : " status-empty"}`,
-            hasAccount ? "Cuenta abierta" : "Sin cuenta",
-        ),
-    );
-    card.append(heading);
-
-    if (hasAccount) {
-        const responsible = cuenta.mozo_responsable_nombre || "Sin responsable";
-        card.append(makeElement("p", "responsible", `Responsable: ${responsible}`));
-    } else if (currentUser && currentUser.rol === "MOZO") {
-        const button = makeElement(
-            "button",
-            "button button-primary",
-            openingTableId === mesa.id ? "Abriendo cuenta…" : "Abrir cuenta",
-        );
-        button.type = "button";
-        button.disabled = openingTableId === mesa.id;
-        button.addEventListener("click", () => openAccount(mesa, button));
-        card.append(button);
+function canLoadOrder(cuenta) {
+    if (!currentUser) return false;
+    if (currentUser.rol === "MOZO") {
+        return !cuenta
+            || cuenta.mozo_responsable_id === null
+            || cuenta.mozo_responsable_id === currentUser.id;
     }
-    return card;
+    return currentUser.rol === "BARRA"
+        && Boolean(cuenta)
+        && cuenta.mozo_responsable_id !== null;
+}
+
+function renderTableButton(mesa, cuenta) {
+    const button = makeElement("button", "zone-table-button");
+    button.type = "button";
+    button.append(makeElement("span", "zone-table-number", String(mesa.numero)));
+    const uncertain = uncertainOrderAccounts.has(mesa.id);
+    const status = !cuenta
+        ? "Sin cuenta abierta"
+        : `Cuenta abierta · ${cuenta.mozo_responsable_nombre || "Sin responsable"}`;
+    button.setAttribute(
+        "aria-label",
+        `${mesa.identificacion}. ${status}${uncertain
+            ? ". Envío anterior sin confirmar; nueva carga bloqueada."
+            : ""}`,
+    );
+    button.disabled = !canLoadOrder(cuenta) || uncertain;
+    if (!button.disabled) {
+        button.addEventListener("click", () => openOrderForm(mesa, cuenta));
+    }
+    return button;
+}
+
+function formatMoney(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return "Precio no disponible";
+    return new Intl.NumberFormat("es-AR", {
+        style: "currency",
+        currency: "ARS",
+    }).format(amount);
+}
+
+function setOrderMessage(text, isError = false, isUncertain = false) {
+    const message = document.getElementById("order-message");
+    message.textContent = text;
+    message.classList.toggle("message-error", isError);
+    message.classList.toggle("order-uncertain", isUncertain);
+    message.hidden = !text;
+}
+
+function isValidQuantity(value) {
+    if (!/^[1-9]\d*$/.test(value)) return false;
+    return Number.isSafeInteger(Number(value));
+}
+
+function updateOrderTotal() {
+    let total = 0;
+    let valid = selectedProducts.size > 0;
+    let validQuantities = true;
+    for (const { product, quantity } of selectedProducts.values()) {
+        if (!isValidQuantity(quantity)) {
+            valid = false;
+            validQuantities = false;
+            continue;
+        }
+        total += Number(product.precio) * Number(quantity);
+    }
+    document.getElementById("order-total").textContent =
+        `Total estimado: ${validQuantities ? formatMoney(total) : "—"}`;
+    const uncertain = orderContext
+        && uncertainOrderAccounts.has(orderContext.mesa.id);
+    const submit = document.getElementById("order-submit");
+    submit.disabled = !valid || !orderCatalogLoaded || orderPending || uncertain;
+    if (uncertain) {
+        submit.textContent = "Resultado sin confirmar";
+    } else if (orderPending) {
+        submit.textContent = "Enviando…";
+    } else {
+        submit.textContent = "Enviar pedido";
+    }
+}
+
+function setOrderPending(pending) {
+    orderPending = pending;
+    document.getElementById("order-cancel").disabled = pending;
+    document.getElementById("order-close").disabled = pending;
+    document.getElementById("product-search").disabled = pending;
+    document
+        .querySelectorAll("#product-catalog button, #order-summary input, #order-summary button")
+        .forEach((control) => {
+            control.disabled = pending;
+        });
+    updateOrderTotal();
+}
+
+function renderProductCatalog() {
+    const container = document.getElementById("product-catalog");
+    const query = document.getElementById("product-search").value
+        .trim()
+        .toLocaleLowerCase("es");
+    const filtered = orderProducts.filter((product) =>
+        product.nombre.toLocaleLowerCase("es").includes(query),
+    );
+    container.replaceChildren();
+    if (filtered.length === 0) {
+        container.append(makeElement(
+            "p",
+            "catalog-empty",
+            query ? "No hay productos que coincidan con la búsqueda."
+                : "No hay productos disponibles.",
+        ));
+        return;
+    }
+
+    const categories = new Map();
+    for (const product of filtered) {
+        const name = product.categoria_nombre || "Sin categoría";
+        if (!categories.has(name)) categories.set(name, []);
+        categories.get(name).push(product);
+    }
+    for (const [categoryName, products] of [...categories].sort(([a], [b]) =>
+        a.localeCompare(b, "es"),
+    )) {
+        const section = makeElement("section", "product-category");
+        section.append(makeElement("h3", "", categoryName));
+        for (const product of products) {
+            const row = makeElement("div", "product-choice");
+            const info = makeElement("div", "product-info");
+            info.append(makeElement("span", "product-name", product.nombre));
+            info.append(makeElement("span", "product-price", formatMoney(product.precio)));
+            row.append(info);
+            const isSelected = selectedProducts.has(product.id);
+            const button = makeElement(
+                "button",
+                "button button-secondary",
+                isSelected ? "Agregado" : "Agregar",
+            );
+            button.type = "button";
+            button.disabled = isSelected || orderPending;
+            button.addEventListener("click", () => addOrderProduct(product));
+            row.append(button);
+            section.append(row);
+        }
+        container.append(section);
+    }
+}
+
+function renderOrderSummary() {
+    const summary = document.getElementById("order-summary");
+    summary.replaceChildren();
+    if (selectedProducts.size === 0) {
+        summary.append(makeElement("p", "summary-empty", "Todavía no agregaste productos."));
+        updateOrderTotal();
+        return;
+    }
+
+    for (const [productId, item] of selectedProducts) {
+        const row = makeElement("div", "summary-item");
+        const info = makeElement("div", "summary-info");
+        info.append(makeElement("span", "summary-name", item.product.nombre));
+        info.append(makeElement(
+            "span",
+            "summary-price",
+            `${formatMoney(item.product.precio)} c/u`,
+        ));
+        row.append(info);
+
+        const controls = makeElement("div", "summary-item-controls");
+        const quantity = makeElement("input", "summary-quantity");
+        quantity.type = "number";
+        quantity.min = "1";
+        quantity.step = "1";
+        quantity.inputMode = "numeric";
+        quantity.setAttribute("aria-label", `Cantidad de ${item.product.nombre}`);
+        quantity.value = item.quantity;
+        quantity.addEventListener("input", () => {
+            item.quantity = quantity.value;
+            quantity.setCustomValidity(
+                isValidQuantity(quantity.value)
+                    ? ""
+                    : "Ingresá una cantidad entera positiva.",
+            );
+            updateOrderTotal();
+        });
+        controls.append(quantity);
+
+        const remove = makeElement("button", "button button-quiet summary-remove", "Quitar");
+        remove.type = "button";
+        remove.addEventListener("click", () => {
+            selectedProducts.delete(productId);
+            renderOrderSummary();
+            renderProductCatalog();
+        });
+        controls.append(remove);
+        row.append(controls);
+        summary.append(row);
+    }
+    updateOrderTotal();
+}
+
+function addOrderProduct(product) {
+    if (orderPending || selectedProducts.has(product.id)) return;
+    selectedProducts.set(product.id, { product, quantity: "1" });
+    renderOrderSummary();
+    renderProductCatalog();
+}
+
+async function openOrderForm(mesa, cuenta) {
+    orderContext = { mesa, cuenta: cuenta || null };
+    orderProducts = [];
+    selectedProducts = new Map();
+    orderPending = false;
+    orderCatalogLoaded = false;
+    const accountStatus = cuenta
+        ? `Cuenta abierta · Responsable: ${
+            cuenta.mozo_responsable_nombre || "Sin responsable"
+        }`
+        : "Sin cuenta abierta · Se abrirá al enviar el pedido";
+    document.getElementById("order-context").textContent =
+        `${mesa.identificacion} · ${accountStatus}`;
+    document.getElementById("product-search").value = "";
+    document.getElementById("order-overlay").hidden = false;
+    document.getElementById("catalog-loading").hidden = false;
+    document.getElementById("catalog-loading").textContent = "Cargando productos…";
+    document.getElementById("product-catalog").replaceChildren();
+    document.getElementById("order-summary").replaceChildren(
+        makeElement("p", "summary-empty", "Todavía no agregaste productos."),
+    );
+    setOrderMessage("");
+    if (uncertainOrderAccounts.has(mesa.id)) {
+        setOrderMessage(
+            "Un envío anterior para esta mesa no pudo confirmarse. "
+                + "No vuelvas a enviarlo desde esta sesión.",
+            false,
+            true,
+        );
+    }
+    updateOrderTotal();
+    document.getElementById("product-search").focus();
+
+    if (uncertainOrderAccounts.has(mesa.id)) {
+        document.getElementById("catalog-loading").hidden = true;
+        return;
+    }
+
+    try {
+        const products = await fetchApi(API.productos);
+        if (!orderContext || orderContext.mesa.id !== mesa.id) return;
+        orderProducts = products;
+        orderCatalogLoaded = true;
+        document.getElementById("catalog-loading").hidden = true;
+        renderProductCatalog();
+        renderOrderSummary();
+    } catch (error) {
+        if (!orderContext || orderContext.mesa.id !== mesa.id) return;
+        document.getElementById("catalog-loading").hidden = true;
+        setOrderMessage(
+            error.message || "No se pudo cargar el catálogo de productos.",
+            true,
+        );
+        updateOrderTotal();
+    }
+}
+
+function closeOrderForm() {
+    if (orderPending) return;
+    document.getElementById("order-overlay").hidden = true;
+    orderContext = null;
+}
+
+async function submitOrder() {
+    if (!orderContext || orderPending || !orderCatalogLoaded) return;
+    if (uncertainOrderAccounts.has(orderContext.mesa.id)) return;
+    if (selectedProducts.size === 0) {
+        setOrderMessage("Agregá al menos un producto antes de enviar.", true);
+        return;
+    }
+    for (const { quantity } of selectedProducts.values()) {
+        if (!isValidQuantity(quantity)) {
+            setOrderMessage("Las cantidades deben ser números enteros positivos.", true);
+            return;
+        }
+    }
+
+    setOrderPending(true);
+
+    let token;
+    try {
+        token = await fetchCsrfToken();
+    } catch (error) {
+        setOrderPending(false);
+        setOrderMessage(
+            error.message || "No se pudo preparar el envío; el pedido no fue enviado.",
+            true,
+        );
+        return;
+    }
+
+    const { mesa, cuenta } = orderContext;
+    const endpoint = currentUser.rol === "BARRA"
+        ? API.cargasBarra
+        : API.pedidosPorMesa;
+    const body = {
+        mesa: mesa.id,
+        detalles: [...selectedProducts.values()].map(({ product, quantity }) => ({
+            producto: product.id,
+            cantidad: Number(quantity),
+        })),
+    };
+    if (currentUser.rol === "BARRA") body.cuenta = cuenta.id;
+    setOrderMessage("");
+
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                "X-CSRFToken": token,
+            },
+            body: JSON.stringify(body),
+        });
+    } catch {
+        markOrderUncertain(mesa.id);
+        setOrderPending(false);
+        setOrderMessage(
+            "No se pudo confirmar si el pedido fue recibido. No lo reenvíes; "
+                + "consultá con el responsable antes de intentar otra carga.",
+            false,
+            true,
+        );
+        return;
+    }
+
+    const data = await readJson(response);
+    if (response.status >= 500) {
+        markOrderUncertain(mesa.id);
+        setOrderPending(false);
+        setOrderMessage(
+            "El servidor tuvo un error y no se pudo confirmar si el pedido fue recibido. "
+                + "No lo reenvíes; consultá con el responsable antes de intentar otra carga.",
+            false,
+            true,
+        );
+        return;
+    }
+    if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+            await handleAuthenticationFailure();
+        }
+        setOrderPending(false);
+        setOrderMessage(
+            formatApiError(data, "El servidor rechazó el pedido."),
+            true,
+        );
+        return;
+    }
+
+    selectedProducts.clear();
+    setOrderPending(false);
+    closeOrderForm();
+    const refreshed = await loadTables();
+    showMessage(
+        refreshed
+            ? "Pedido enviado correctamente. Se actualizaron las mesas."
+            : "Pedido enviado correctamente. No se pudo actualizar el listado; "
+                + "el pedido quedó confirmado.",
+    );
 }
 
 function renderTables(mesas, cuentas) {
@@ -256,9 +654,9 @@ function renderTables(mesas, cuentas) {
             ),
         );
         section.append(heading);
-        const grid = makeElement("div", "table-grid");
+        const grid = makeElement("div", "zone-table-list");
         for (const mesa of zoneTables) {
-            grid.append(renderTableCard(mesa, accountsByTable.get(mesa.id)));
+            grid.append(renderTableButton(mesa, accountsByTable.get(mesa.id)));
         }
         section.append(grid);
         container.append(section);
@@ -285,35 +683,6 @@ async function loadTables() {
     }
 }
 
-async function openAccount(mesa, button) {
-    if (openingTableId !== null) return;
-    openingTableId = mesa.id;
-    button.disabled = true;
-    button.textContent = "Abriendo cuenta…";
-    showMessage("");
-    let resultMessage = "";
-    let resultIsError = false;
-    try {
-        await fetchApi(API.cuentas, {
-            method: "POST",
-            body: JSON.stringify({ mesa: mesa.id }),
-        });
-        resultMessage = `Cuenta abierta para ${mesa.identificacion}.`;
-    } catch (error) {
-        resultMessage = error.message || "No se pudo abrir la cuenta.";
-        resultIsError = true;
-    } finally {
-        openingTableId = null;
-        const refreshed = await loadTables();
-        if (refreshed) {
-            showMessage(resultMessage, resultIsError);
-        } else if (button.isConnected) {
-            button.disabled = false;
-            button.textContent = "Abrir cuenta";
-        }
-    }
-}
-
 function initializeLogin() {
     const form = document.getElementById("login-form");
     form.addEventListener("submit", submitLogin);
@@ -323,11 +692,35 @@ async function initializeOperationalPage() {
     document.getElementById("logout-button").addEventListener("click", logout);
     const user = await loadCurrentUser();
     if (!user) return;
+    const uncertainRestoreError = restoreUncertainOrderMesas(user.id);
 
     if (document.body.dataset.page === "mesas") {
+        initializeOrderForm();
         document.getElementById("refresh-button").addEventListener("click", loadTables);
         await loadTables();
     }
+    if (uncertainRestoreError) showMessage(uncertainRestoreError, true);
+}
+
+function initializeOrderForm() {
+    document.getElementById("order-close").addEventListener("click", closeOrderForm);
+    document.getElementById("order-cancel").addEventListener("click", closeOrderForm);
+    document.getElementById("order-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        submitOrder();
+    });
+    document.getElementById("product-search").addEventListener("input", renderProductCatalog);
+    document.getElementById("order-overlay").addEventListener("click", (event) => {
+        if (event.target === event.currentTarget) closeOrderForm();
+    });
+    document.addEventListener("keydown", (event) => {
+        if (
+            event.key === "Escape"
+            && !document.getElementById("order-overlay").hidden
+        ) {
+            closeOrderForm();
+        }
+    });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
