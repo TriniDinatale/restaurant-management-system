@@ -315,6 +315,58 @@ class DetallePedido(models.Model):
         return f"{self.cantidad} x {self.producto.nombre}"
 
 
+class SolicitudCancelacionDetalle(models.Model):
+    class Estado(models.TextChoices):
+        PENDIENTE = "PENDIENTE", "Pendiente"
+        ACEPTADA = "ACEPTADA", "Aceptada"
+        RECHAZADA = "RECHAZADA", "Rechazada"
+
+    detalle = models.ForeignKey(
+        DetallePedido,
+        on_delete=models.PROTECT,
+        related_name="solicitudes_cancelacion",
+    )
+    solicitante = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="solicitudes_cancelacion_detalle",
+    )
+    cantidad = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+    )
+    clave_idempotencia = models.UUIDField(unique=True, editable=False)
+    motivo = models.TextField()
+    fecha_solicitud = models.DateTimeField(auto_now_add=True)
+    estado = models.CharField(
+        max_length=10,
+        choices=Estado.choices,
+        default=Estado.PENDIENTE,
+    )
+    resuelto_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="resoluciones_cancelacion_detalle",
+    )
+    fecha_resolucion = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["fecha_solicitud", "pk"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(cantidad__gt=0),
+                name="solicitud_cancelacion_cantidad_positiva",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"Solicitud {self.pk} · detalle {self.detalle_id} "
+            f"· {self.cantidad} · {self.estado}"
+        )
+
+
 class PreparacionPedidoSector(models.Model):
     class Estado(models.TextChoices):
         PENDIENTE = "PENDIENTE", "Pendiente"

@@ -28,7 +28,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
     font: inherit;
 }
 
@@ -217,6 +218,154 @@ h2 {
     font-size: 0.92rem;
 }
 
+.notification-bell {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.notification-bell[hidden] {
+    display: none;
+}
+
+.notification-toggle {
+    position: relative;
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+}
+
+.notification-icon {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.8;
+}
+
+.notification-count {
+    display: inline-grid;
+    min-width: 22px;
+    height: 22px;
+    place-items: center;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--primary);
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 800;
+}
+
+.notification-count[hidden],
+.notification-sync-error[hidden] {
+    display: none;
+}
+
+.notification-sync-error {
+    color: var(--muted);
+    font-size: 0.76rem;
+}
+
+.notification-panel {
+    position: fixed;
+    z-index: 40;
+    top: 78px;
+    right: clamp(12px, 4vw, 44px);
+    display: grid;
+    width: min(420px, calc(100vw - 24px));
+    max-height: min(75vh, 620px);
+    grid-template-rows: auto auto minmax(0, 1fr);
+    gap: 10px;
+    overflow: hidden;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface);
+    box-shadow: 0 16px 42px rgb(0 0 0 / 18%);
+}
+
+.notification-panel[hidden] {
+    display: none;
+}
+
+.notification-panel-heading,
+.notification-item-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.notification-panel-heading h2 {
+    font-size: 1.05rem;
+}
+
+.notification-close {
+    min-height: 38px;
+    padding: 5px 9px;
+}
+
+.notification-error {
+    margin: 0;
+    color: var(--error-border);
+    font-size: 0.86rem;
+}
+
+.notification-list {
+    display: grid;
+    align-content: start;
+    gap: 9px;
+    overflow-y: auto;
+}
+
+.notification-empty {
+    margin: 0;
+    padding: 12px 4px;
+    color: var(--muted);
+}
+
+.notification-item {
+    display: grid;
+    gap: 6px;
+    padding: 11px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--canvas);
+}
+
+.notification-item p {
+    margin: 0;
+    font-size: 0.88rem;
+    overflow-wrap: anywhere;
+}
+
+.notification-item > button {
+    min-height: 42px;
+}
+
+.notification-status {
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-align: right;
+}
+
+.notification-status-pendiente {
+    color: var(--primary-dark);
+    font-weight: 700;
+}
+
+.notification-status-aceptada {
+    color: var(--primary);
+}
+
+.notification-status-rechazada {
+    color: var(--error-border);
+}
+
 .page-shell {
     width: min(100% - 32px, 1120px);
     margin: 0 auto;
@@ -385,7 +534,9 @@ h2 {
     margin-top: 0;
 }
 
-.order-overlay {
+.account-overlay,
+.order-overlay,
+.cancellation-overlay {
     position: fixed;
     z-index: 10;
     inset: 0;
@@ -395,13 +546,30 @@ h2 {
     background: rgb(13 29 25 / 60%);
 }
 
-.order-overlay[hidden] {
+.account-overlay {
+    z-index: 10;
+}
+
+.order-overlay {
+    z-index: 20;
+}
+
+.cancellation-overlay {
+    z-index: 30;
+}
+
+.account-overlay[hidden],
+.order-overlay[hidden],
+.cancellation-overlay[hidden] {
     display: none;
 }
 
-.order-panel {
+.account-panel,
+.order-panel,
+.cancellation-panel {
     display: flex;
     width: min(100%, 1100px);
+    height: min(92vh, 900px);
     max-height: min(92vh, 900px);
     flex-direction: column;
     overflow: hidden;
@@ -409,6 +577,52 @@ h2 {
     border-radius: 18px;
     background: var(--canvas);
     box-shadow: 0 24px 70px rgb(0 0 0 / 25%);
+}
+
+.account-header {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 16px;
+}
+
+.account-heading-copy {
+    min-width: 0;
+}
+
+.account-heading-copy .eyebrow {
+    margin-top: 0;
+}
+
+.account-heading-copy .intro {
+    margin: 8px 0 4px;
+}
+
+.account-responsible {
+    margin: 0;
+    color: var(--muted);
+    font-weight: 700;
+}
+
+.account-actions {
+    display: flex;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 9px;
+}
+
+.account-content {
+    min-height: 0;
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 2px 2px;
+}
+
+.account-total {
+    flex: 0 0 auto;
 }
 
 .order-header {
@@ -430,7 +644,9 @@ h2 {
 #order-form {
     display: flex;
     min-height: 0;
+    flex: 1;
     flex-direction: column;
+    overflow: hidden;
 }
 
 .order-layout {
@@ -527,6 +743,189 @@ h2 {
     gap: 9px;
 }
 
+.account-consumption {
+    display: grid;
+    gap: 12px;
+}
+
+.consumption-order {
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: white;
+}
+
+.consumption-order-heading {
+    display: grid;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.consumption-order-heading strong {
+    color: var(--ink);
+}
+
+.consumption-barra-label {
+    color: var(--primary-dark);
+    font-weight: 700;
+}
+
+.consumption-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+}
+
+.consumption-product {
+    display: grid;
+    gap: 3px;
+}
+
+.consumption-product-name {
+    overflow-wrap: anywhere;
+    font-weight: 700;
+}
+
+.consumption-item-price,
+.consumption-quantity {
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.consumption-subtotal {
+    text-align: right;
+}
+
+.consumption-original-subtotal,
+.cancellation-history,
+.cancellation-request-open {
+    grid-column: 1 / -1;
+}
+
+.consumption-original-subtotal {
+    color: var(--muted);
+    text-align: right;
+}
+
+.cancellation-history {
+    display: grid;
+    gap: 4px;
+    padding: 9px;
+    border-radius: 8px;
+    background: var(--warning-bg);
+    font-size: 0.9rem;
+    overflow-wrap: anywhere;
+}
+
+.cancellation-aceptada {
+    background: var(--accent);
+}
+
+.cancellation-rechazada {
+    background: var(--error-bg);
+}
+
+.cancellation-request-open {
+    width: fit-content;
+    min-width: 76px;
+    min-height: 44px;
+    padding: 6px 12px;
+    color: var(--primary-dark);
+    font-size: 0.86rem;
+}
+
+.consumption-total {
+    margin: 2px 0 0;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+    font-size: 1.1rem;
+    font-weight: 800;
+    text-align: right;
+}
+
+.cancellation-panel {
+    width: min(100%, 520px);
+    height: auto;
+    max-height: min(90vh, 760px);
+    overflow-y: auto;
+    background: var(--canvas);
+}
+
+.cancellation-form {
+    display: grid;
+    gap: 9px;
+}
+
+.cancellation-form label {
+    font-weight: 700;
+}
+
+.cancellation-form input,
+.cancellation-form textarea {
+    width: 100%;
+    min-height: 46px;
+    padding: 10px 12px;
+    border: 1px solid #b9c9c0;
+    border-radius: 9px;
+    background: white;
+    color: var(--ink);
+}
+
+.cancellation-form textarea {
+    resize: vertical;
+}
+
+.cancellation-page-actions,
+.cancellation-review-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+}
+
+.cancellation-list {
+    display: grid;
+    gap: 14px;
+}
+
+.cancellation-card {
+    display: grid;
+    gap: 10px;
+    padding: 16px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--surface);
+    overflow-wrap: anywhere;
+}
+
+.cancellation-card p {
+    margin: 0;
+}
+
+.cancellation-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.cancellation-status {
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: var(--warning-bg);
+    font-size: 0.86rem;
+    font-weight: 700;
+}
+
+.cancellation-review-actions .button {
+    flex: 1 1 120px;
+}
+
 .summary-item {
     align-items: flex-start;
 }
@@ -562,8 +961,10 @@ h2 {
 
 .order-actions {
     display: grid;
+    flex: 0 0 auto;
     grid-template-columns: 1fr 1fr;
     gap: 9px;
+    margin-top: 12px;
 }
 
 .catalog-empty,
@@ -613,16 +1014,43 @@ h2 {
         width: 100%;
     }
 
-    .order-overlay {
-        align-items: end;
+    .account-overlay,
+    .order-overlay,
+    .cancellation-overlay {
+        align-items: stretch;
         padding: 0;
     }
 
-    .order-panel {
+    .account-panel,
+    .order-panel,
+    .cancellation-panel {
         width: 100%;
-        max-height: 96vh;
+        height: 100vh;
+        max-height: 100vh;
         padding: 17px;
-        border-radius: 18px 18px 0 0;
+        border-radius: 0;
+    }
+
+    .account-panel {
+        min-height: 0;
+    }
+
+    .cancellation-panel {
+        min-height: 0;
+    }
+
+    .account-header {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .account-actions {
+        justify-content: stretch;
+    }
+
+    .account-actions .button {
+        flex: 1 1 140px;
     }
 
     .order-header {
@@ -645,6 +1073,26 @@ h2 {
     .catalog-section,
     .summary-section {
         padding: 14px;
+    }
+
+    .consumption-item {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .consumption-quantity,
+    .consumption-subtotal {
+        grid-column: 1 / -1;
+    }
+
+    .consumption-subtotal {
+        grid-row: auto;
+        text-align: left;
+    }
+
+    .consumption-original-subtotal,
+    .cancellation-history,
+    .cancellation-request-open {
+        grid-column: 1 / -1;
     }
 }
 

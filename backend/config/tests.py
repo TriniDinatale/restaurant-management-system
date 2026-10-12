@@ -67,27 +67,61 @@ class WebInterfaceAccessTests(TestCase):
                 response = self.client.get(reverse("web-mesas"))
                 self.assertEqual(response.status_code, 200)
                 self.assertTemplateUsed(response, "usuarios/mesas.html")
+                self.assertContains(response, 'id="notification-toggle"')
                 self.assertContains(response, "Actualizar datos")
+                if user.rol == User.Rol.BARRA:
+                    self.assertContains(response, "Solicitudes de cancelación")
+                    cancellation_page = self.client.get(
+                        reverse("web-cancelaciones")
+                    )
+                    self.assertEqual(cancellation_page.status_code, 200)
+                    self.assertTemplateUsed(
+                        cancellation_page,
+                        "usuarios/cancelaciones.html",
+                    )
+                else:
+                    self.assertRedirects(
+                        self.client.get(reverse("web-cancelaciones")),
+                        reverse("web-mesas"),
+                    )
                 self.assertContains(response, "Cerrar sesión")
                 self.assertRedirects(
                     self.client.get(reverse("web-pendiente")),
                     reverse("web-mesas"),
                 )
 
-    def test_administrator_and_kitchen_only_receive_pending_screen(self):
-        for user in [self.admin, self.cocina]:
-            with self.subTest(role=user.rol):
-                self.client.force_login(user)
-                self.assertRedirects(
-                    self.client.get(reverse("web-home")),
-                    reverse("web-pendiente"),
-                )
-                response = self.client.get(reverse("web-pendiente"))
-                self.assertEqual(response.status_code, 200)
-                self.assertTemplateUsed(response, "usuarios/pendiente.html")
-                self.assertContains(response, "pantalla operativa está pendiente")
-                self.assertContains(response, "Cerrar sesión")
-                self.assertRedirects(
-                    self.client.get(reverse("web-mesas")),
-                    reverse("web-pendiente"),
-                )
+    def test_administrator_keeps_pending_screen(self):
+        self.client.force_login(self.admin)
+        self.assertRedirects(
+            self.client.get(reverse("web-home")),
+            reverse("web-pendiente"),
+        )
+        response = self.client.get(reverse("web-pendiente"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "usuarios/pendiente.html")
+        self.assertContains(response, "pantalla operativa está pendiente")
+        self.assertContains(response, "Cerrar sesión")
+        self.assertRedirects(
+            self.client.get(reverse("web-mesas")),
+            reverse("web-pendiente"),
+        )
+
+    def test_kitchen_uses_sector_cancellation_screen(self):
+        self.client.force_login(self.cocina)
+        self.assertRedirects(
+            self.client.get(reverse("web-home")),
+            reverse("web-cancelaciones"),
+        )
+        self.assertRedirects(
+            self.client.get(reverse("web-pendiente")),
+            reverse("web-cancelaciones"),
+        )
+        response = self.client.get(reverse("web-cancelaciones"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "usuarios/cancelaciones.html")
+        self.assertContains(response, "Solicitudes de cancelación")
+        self.assertContains(response, 'id="notification-toggle"')
+        self.assertRedirects(
+            self.client.get(reverse("web-mesas")),
+            reverse("web-cancelaciones"),
+        )

@@ -1,0 +1,42 @@
+{% extends "usuarios/base.html" %}
+{% block title %}Solicitudes de cancelación · Gestión del restaurante{% endblock %}
+{% block page_name %}cancelaciones{% endblock %}
+{% block content %}
+<header class="topbar">
+    <a class="brand" href="/" aria-label="Gestión del restaurante, inicio">
+        <span class="brand-mark brand-mark-small" aria-hidden="true">R</span>
+        <span>Restaurante</span>
+    </a>
+    <div class="user-tools">
+        {% include "usuarios/_notification_bell.html" %}
+        <span id="user-label" class="user-label">Cargando usuario…</span>
+        <button id="logout-button" class="button button-quiet" type="button">
+            Cerrar sesión
+        </button>
+    </div>
+</header>
+<main class="page-shell">
+    <section class="page-heading">
+        <div>
+            <p class="eyebrow">OPERACIÓN</p>
+            <h1>Solicitudes de cancelación</h1>
+            <p class="intro">
+                Revisá únicamente las solicitudes destinadas a tu sector.
+            </p>
+        </div>
+        <div class="cancellation-page-actions">
+            <a id="tables-nav" class="button button-secondary" href="/mesas/" hidden>
+                Volver a mesas
+            </a>
+            <button id="cancellations-refresh" class="button button-secondary" type="button">
+                Actualizar solicitudes
+            </button>
+        </div>
+    </section>
+    <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
+    <p id="cancellations-loading" class="loading-message" role="status">
+        Cargando solicitudes…
+    </p>
+    <div id="cancellation-list" class="cancellation-list" aria-live="polite"></div>
+</main>
+{% endblock %}

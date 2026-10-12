@@ -1,4 +1,6 @@
 
+from decimal import Decimal
+
 from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
@@ -13,6 +15,7 @@ from .models import (
     Mesa,
     Pedido,
     PreparacionPedidoSector,
+    SolicitudCancelacionDetalle,
 )
 
 
@@ -344,6 +347,258 @@ class CuentaSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"mesa": "Esta mesa ya tiene una cuenta abierta."}
             ) from exc
+
+
+class SolicitudCancelacionSerializer(serializers.ModelSerializer):
+    solicitante_id = serializers.IntegerField(read_only=True)
+    solicitante_nombre = serializers.SerializerMethodField()
+    resuelto_por_id = serializers.IntegerField(read_only=True)
+    resuelto_por_nombre = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SolicitudCancelacionDetalle
+        fields = [
+            "id",
+            "clave_idempotencia",
+            "cantidad",
+            "motivo",
+            "fecha_solicitud",
+            "estado",
+            "solicitante_id",
+            "solicitante_nombre",
+            "resuelto_por_id",
+            "resuelto_por_nombre",
+            "fecha_resolucion",
+        ]
+        read_only_fields = fields
+
+    def get_solicitante_nombre(self, solicitud):
+        return (
+            solicitud.solicitante.get_full_name().strip()
+            or solicitud.solicitante.username
+        )
+
+    def get_resuelto_por_nombre(self, solicitud):
+        if solicitud.resuelto_por is None:
+            return None
+        return (
+            solicitud.resuelto_por.get_full_name().strip()
+            or solicitud.resuelto_por.username
+        )
+
+
+class SolicitudCancelacionCreateSerializer(serializers.Serializer):
+    clave_idempotencia = serializers.UUIDField()
+    cantidad = serializers.IntegerField(min_value=1)
+    motivo = serializers.CharField(
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+
+
+class ResolverCancelacionSerializer(serializers.Serializer):
+    estado = serializers.ChoiceField(
+        choices=[SolicitudCancelacionDetalle.Estado.ACEPTADA],
+    )
+
+
+class SolicitudCancelacionPendienteSerializer(SolicitudCancelacionSerializer):
+    cuenta_id = serializers.IntegerField(source="detalle.pedido.cuenta_id")
+    mesa_identificacion = serializers.CharField(
+        source="detalle.pedido.mesa.identificacion",
+    )
+    zona = serializers.SerializerMethodField()
+    mesa_numero = serializers.IntegerField(source="detalle.pedido.mesa.numero")
+    pedido_id = serializers.IntegerField(source="detalle.pedido_id")
+    detalle_id = serializers.IntegerField(read_only=True)
+    producto_nombre = serializers.CharField(source="detalle.producto.nombre")
+    cantidad_original = serializers.IntegerField(source="detalle.cantidad")
+    cantidad_cancelada = serializers.SerializerMethodField()
+    cantidad_vigente = serializers.SerializerMethodField()
+    precio_unitario = serializers.DecimalField(
+        source="detalle.precio_unitario",
+        max_digits=10,
+        decimal_places=2,
+    )
+
+    class Meta(SolicitudCancelacionSerializer.Meta):
+        fields = SolicitudCancelacionSerializer.Meta.fields + [
+            "cuenta_id",
+            "mesa_identificacion",
+            "zona",
+            "mesa_numero",
+            "pedido_id",
+            "detalle_id",
+            "producto_nombre",
+            "cantidad_original",
+            "cantidad_cancelada",
+            "cantidad_vigente",
+            "precio_unitario",
+        ]
+
+    def get_zona(self, solicitud):
+        return solicitud.detalle.pedido.mesa.get_zona_display()
+
+    def get_cantidad_cancelada(self, solicitud):
+        detalle = solicitud.detalle
+        return sum(
+            otra.cantidad
+            for otra in detalle.solicitudes_cancelacion.all()
+            if otra.estado == SolicitudCancelacionDetalle.Estado.ACEPTADA
+        )
+
+    def get_cantidad_vigente(self, solicitud):
+        return (
+            solicitud.detalle.cantidad
+            - self.get_cantidad_cancelada(solicitud)
+        )
+
+
+class DetalleConsumoSerializer(serializers.ModelSerializer):
+    producto_nombre = serializers.CharField(
+        source="producto.nombre",
+        read_only=True,
+    )
+    cantidad_cancelada = serializers.SerializerMethodField()
+    cantidad_vigente = serializers.SerializerMethodField()
+    cantidad_pendiente = serializers.SerializerMethodField()
+    cantidad_disponible_cancelacion = serializers.SerializerMethodField()
+    subtotal_original = serializers.SerializerMethodField()
+    subtotal = serializers.SerializerMethodField()
+    solicitudes_cancelacion = SolicitudCancelacionSerializer(
+        many=True,
+        read_only=True,
+    )
+
+    class Meta:
+        model = DetallePedido
+        fields = [
+            "id",
+            "producto",
+            "producto_nombre",
+            "cantidad",
+            "cantidad_cancelada",
+            "cantidad_vigente",
+            "cantidad_pendiente",
+            "cantidad_disponible_cancelacion",
+            "precio_unitario",
+            "subtotal_original",
+            "subtotal",
+            "solicitudes_cancelacion",
+        ]
+        read_only_fields = fields
+
+    def get_cantidad_cancelada(self, detalle):
+        return sum(
+            solicitud.cantidad
+            for solicitud in detalle.solicitudes_cancelacion.all()
+            if solicitud.estado == SolicitudCancelacionDetalle.Estado.ACEPTADA
+        )
+
+    def get_cantidad_pendiente(self, detalle):
+        return sum(
+            solicitud.cantidad
+            for solicitud in detalle.solicitudes_cancelacion.all()
+            if solicitud.estado == SolicitudCancelacionDetalle.Estado.PENDIENTE
+        )
+
+    def get_cantidad_vigente(self, detalle):
+        return detalle.cantidad - self.get_cantidad_cancelada(detalle)
+
+    def get_cantidad_disponible_cancelacion(self, detalle):
+        return (
+            detalle.cantidad
+            - self.get_cantidad_cancelada(detalle)
+            - self.get_cantidad_pendiente(detalle)
+        )
+
+    def get_subtotal_original(self, detalle):
+        return detalle.subtotal
+
+    def get_subtotal(self, detalle):
+        return detalle.precio_unitario * self.get_cantidad_vigente(detalle)
+
+
+class PedidoConsumoSerializer(serializers.ModelSerializer):
+    autor_id = serializers.SerializerMethodField()
+    autor_nombre = serializers.SerializerMethodField()
+    agregado_por_barra = serializers.SerializerMethodField()
+    detalles = DetalleConsumoSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Pedido
+        fields = [
+            "id",
+            "fecha_creacion",
+            "autor_id",
+            "autor_nombre",
+            "agregado_por_barra",
+            "detalles",
+        ]
+        read_only_fields = fields
+
+    def get_autor_nombre(self, pedido):
+        autor = pedido.creado_por or pedido.mozo
+        return autor.get_full_name().strip() or autor.username
+
+    def get_autor_id(self, pedido):
+        return pedido.creado_por_id or pedido.mozo_id
+
+    def get_agregado_por_barra(self, pedido):
+        return getattr(pedido, "aviso_carga_barra", None) is not None
+
+
+class CuentaConsumoSerializer(serializers.ModelSerializer):
+    mesa_identificacion = serializers.CharField(
+        source="mesa.identificacion",
+        read_only=True,
+    )
+    responsable = serializers.SerializerMethodField()
+    pedidos = PedidoConsumoSerializer(many=True, read_only=True)
+    total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Cuenta
+        fields = [
+            "id",
+            "mesa",
+            "mesa_identificacion",
+            "responsable",
+            "pedidos",
+            "total",
+        ]
+        read_only_fields = fields
+
+    def get_responsable(self, cuenta):
+        responsable = cuenta.mozo_responsable
+        if responsable is None:
+            return None
+        return {
+            "id": responsable.pk,
+            "nombre": (
+                responsable.get_full_name().strip() or responsable.username
+            ),
+        }
+
+    def get_total(self, cuenta):
+        return sum(
+            (
+                detalle.precio_unitario
+                * (
+                    detalle.cantidad
+                    - sum(
+                        solicitud.cantidad
+                        for solicitud in detalle.solicitudes_cancelacion.all()
+                        if solicitud.estado
+                        == SolicitudCancelacionDetalle.Estado.ACEPTADA
+                    )
+                )
+                for pedido in cuenta.pedidos.all()
+                for detalle in pedido.detalles.all()
+            ),
+            Decimal("0.00"),
+        )
 
 
 class MesaSerializer(serializers.ModelSerializer):

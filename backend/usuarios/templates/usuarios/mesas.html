@@ -8,6 +8,7 @@
         <span>Restaurante</span>
     </a>
     <div class="user-tools">
+        {% include "usuarios/_notification_bell.html" %}
         <span id="user-label" class="user-label">Cargando usuario…</span>
         <button id="logout-button" class="button button-quiet" type="button">
             Cerrar sesión
@@ -19,16 +20,55 @@
         <div>
             <p class="eyebrow">OPERACIÓN</p>
             <h1>Mesas</h1>
-            <p class="intro">Seleccioná una mesa para cargar un pedido.</p>
+            <p class="intro">Seleccioná una mesa para consultar su cuenta.</p>
         </div>
         <button id="refresh-button" class="button button-secondary" type="button">
             Actualizar datos
         </button>
+        <a id="cancellation-nav" class="button button-secondary"
+           href="/cancelaciones/" hidden>
+            Solicitudes de cancelación
+        </a>
     </section>
     <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
     <p id="loading-message" class="loading-message" role="status">Cargando mesas y cuentas…</p>
     <div id="zones" class="zones" aria-live="polite"></div>
 </main>
+<div id="account-overlay" class="account-overlay" hidden>
+    <section
+        id="account-panel"
+        class="account-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="account-title"
+        aria-describedby="account-context account-responsible"
+    >
+        <header class="account-header">
+            <div class="account-heading-copy">
+                <p class="eyebrow">CUENTA</p>
+                <h1 id="account-title">Consumo de la cuenta</h1>
+                <p id="account-context" class="intro"></p>
+                <p id="account-responsible" class="account-responsible"></p>
+            </div>
+            <div class="account-actions">
+                <button id="new-order-open" class="button button-primary" type="button" hidden>
+                    Nuevo pedido
+                </button>
+                <button id="account-close" class="button button-quiet" type="button">
+                    Volver a mesas
+                </button>
+            </div>
+        </header>
+        <div id="account-message" class="message" role="alert" aria-live="polite" hidden></div>
+        <div class="account-content">
+            <p id="consumption-loading" class="loading-message" role="status" hidden>
+                Cargando consumo…
+            </p>
+            <div id="account-consumption" class="account-consumption"></div>
+        </div>
+        <p id="account-total" class="consumption-total account-total" hidden></p>
+    </section>
+</div>
 <div id="order-overlay" class="order-overlay" hidden>
     <section
         id="order-panel"
@@ -68,15 +108,51 @@
                     </div>
                     <div id="order-summary" class="order-summary"></div>
                     <p id="order-total" class="order-total">Total estimado: $0,00</p>
-                    <div class="order-actions">
-                        <button id="order-cancel" class="button button-quiet" type="button">
-                            Cancelar
-                        </button>
-                        <button id="order-submit" class="button button-primary" type="submit" disabled>
-                            Enviar pedido
-                        </button>
-                    </div>
                 </section>
+            </div>
+            <div class="order-actions">
+                <button id="order-cancel" class="button button-quiet" type="button">
+                    Cancelar
+                </button>
+                <button id="order-submit" class="button button-primary" type="submit" disabled>
+                    Enviar pedido
+                </button>
+            </div>
+        </form>
+    </section>
+</div>
+<div id="cancellation-overlay" class="cancellation-overlay" hidden>
+    <section
+        id="cancellation-panel"
+        class="cancellation-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="cancellation-title"
+    >
+        <header class="order-header">
+            <div>
+                <p class="eyebrow">CONSUMO ENVIADO</p>
+                <h1 id="cancellation-title">Cancelar producto</h1>
+                <p id="cancellation-product" class="intro"></p>
+            </div>
+            <button id="cancellation-close" class="button button-quiet" type="button">
+                Cerrar
+            </button>
+        </header>
+        <div id="cancellation-message" class="message" role="alert" aria-live="polite" hidden></div>
+        <form id="cancellation-form" class="cancellation-form">
+            <label for="cancellation-quantity">Unidades a cancelar</label>
+            <input id="cancellation-quantity" name="cantidad" type="number"
+                   min="1" step="1" required>
+            <label for="cancellation-reason">Motivo</label>
+            <textarea id="cancellation-reason" name="motivo" rows="4" required></textarea>
+            <div class="order-actions">
+                <button id="cancellation-cancel" class="button button-quiet" type="button">
+                    Volver
+                </button>
+                <button id="cancellation-submit" class="button button-primary" type="submit">
+                    Solicitar cancelación
+                </button>
             </div>
         </form>
     </section>

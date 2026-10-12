@@ -8,12 +8,17 @@ from .views import (
     AvisosRetiroListView,
     ConfirmarRetiroView,
     ControlRetiroBarraListView,
+    CuentaConsumoView,
     MesaListView,
     BarraPedidoCreateView,
     AvisosCargaBarraListView,
     RegistroCargaBarraListView,
     PreparacionPedidoSectorEstadoView,
     PreparacionPedidoSectorListView,
+    ResolverSolicitudCancelacionView,
+    NotificacionesCancelacionListView,
+    SolicitudCancelacionCreateView,
+    SolicitudesCancelacionPendientesView,
 )
 
 urlpatterns = [
@@ -48,6 +53,31 @@ urlpatterns = [
         "cuentas/",
         CuentaListCreateView.as_view(),
         name="cuenta-create",
+    ),
+    path(
+        "cuentas/<int:pk>/consumo/",
+        CuentaConsumoView.as_view(),
+        name="cuenta-consumo",
+    ),
+    path(
+        "cuentas/<int:cuenta_id>/detalles/<int:detalle_id>/cancelaciones/",
+        SolicitudCancelacionCreateView.as_view(),
+        name="detalle-solicitar-cancelacion",
+    ),
+    path(
+        "cancelaciones/pendientes/",
+        SolicitudesCancelacionPendientesView.as_view(),
+        name="cancelacion-pendiente-list",
+    ),
+    path(
+        "cancelaciones/notificaciones/",
+        NotificacionesCancelacionListView.as_view(),
+        name="cancelacion-notificacion-list",
+    ),
+    path(
+        "cancelaciones/<int:pk>/resolver/",
+        ResolverSolicitudCancelacionView.as_view(),
+        name="cancelacion-resolver",
     ),
     path(
         "preparacion/",

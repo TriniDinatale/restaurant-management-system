@@ -16,6 +16,7 @@ from .models import (
     Mesa,
     Pedido,
     PreparacionPedidoSector,
+    SolicitudCancelacionDetalle,
 )
 
 from django.urls import reverse
@@ -24,6 +25,7 @@ from rest_framework.test import APITestCase
 
 from unittest.mock import patch
 from django.db import IntegrityError, transaction
+from uuid import uuid4
 
 class PedidoModelTests(TestCase):
     def setUp(self):
@@ -2478,3 +2480,924 @@ class RetiroPedidoAPITests(APITestCase):
             self.client.get(self.avisos_url).status_code,
             status.HTTP_403_FORBIDDEN,
         )
+
+
+class CuentaConsumoAPITests(APITestCase):
+    def setUp(self):
+        self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        self.barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.pizza = Sector.objects.create(nombre=Sector.Nombre.PIZZA)
+        self.mozo = User.objects.create_user(
+            username="consumo_mozo",
+            password="test-password",
+            first_name="Ana",
+            last_name="Gomez",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.otro_mozo = User.objects.create_user(
+            username="consumo_otro_mozo",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.usuario_barra = User.objects.create_user(
+            username="consumo_barra",
+            password="test-password",
+            rol=User.Rol.BARRA,
+            sector=self.barra,
+        )
+        self.admin = User.objects.create_user(
+            username="consumo_admin",
+            password="test-password",
+            rol=User.Rol.ADMINISTRADOR,
+        )
+        self.cocina = User.objects.create_user(
+            username="consumo_cocina",
+            password="test-password",
+            rol=User.Rol.COCINA,
+            sector=self.pizza,
+        )
+        self.mesa = Mesa.objects.create(
+            numero=71,
+            zona=Mesa.Zona.VEREDA_A,
+        )
+        self.cuenta = Cuenta.objects.create(
+            mesa=self.mesa,
+            mozo_responsable=self.mozo,
+        )
+        self.categoria = Categoria.objects.create(nombre="Bebidas consumo")
+        self.producto = Producto.objects.create(
+            nombre="Limonada consumo",
+            precio=Decimal("1200.00"),
+            categoria=self.categoria,
+            sector_destino=self.barra,
+        )
+        self.url = reverse("cuenta-consumo", args=[self.cuenta.pk])
+
+    def crear_pedido(self, autor, cantidad=1, producto=None):
+        pedido = Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=self.cuenta,
+            mozo=self.mozo,
+            creado_por=autor,
+        )
+        DetallePedido.objects.create(
+            pedido=pedido,
+            producto=producto or self.producto,
+            cantidad=cantidad,
+        )
+        if autor == self.usuario_barra:
+            AvisoCargaBarra.objects.create(
+                pedido=pedido,
+                destinatario=self.mozo,
+            )
+        return pedido
+
+    def consultar_como(self, usuario):
+        self.client.force_authenticate(user=usuario)
+        return self.client.get(self.url)
+
+    def test_suma_pedidos_de_mozo_y_barra_usando_precios_guardados(self):
+        pedido_mozo = self.crear_pedido(self.mozo, cantidad=2)
+        self.producto.precio = Decimal("1900.00")
+        self.producto.save()
+        pedido_barra = self.crear_pedido(self.usuario_barra, cantidad=3)
+
+        response = self.consultar_como(self.mozo)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], self.cuenta.pk)
+        self.assertEqual(response.data["mesa"], self.mesa.pk)
+        self.assertEqual(
+            response.data["mesa_identificacion"],
+            "Vereda A · Mesa 71",
+        )
+        self.assertEqual(
+            response.data["responsable"],
+            {"id": self.mozo.pk, "nombre": "Ana Gomez"},
+        )
+        self.assertEqual(
+            {pedido["id"] for pedido in response.data["pedidos"]},
+            {pedido_mozo.pk, pedido_barra.pk},
+        )
+        pedido_por_id = {
+            pedido["id"]: pedido for pedido in response.data["pedidos"]
+        }
+        detalle_mozo = pedido_por_id[pedido_mozo.pk]["detalles"][0]
+        self.assertEqual(Decimal(detalle_mozo["precio_unitario"]), Decimal("1200.00"))
+        self.assertEqual(Decimal(detalle_mozo["subtotal"]), Decimal("2400.00"))
+        self.assertFalse(pedido_por_id[pedido_mozo.pk]["agregado_por_barra"])
+        self.assertEqual(pedido_por_id[pedido_mozo.pk]["autor_id"], self.mozo.pk)
+        detalle_barra = pedido_por_id[pedido_barra.pk]["detalles"][0]
+        self.assertEqual(Decimal(detalle_barra["precio_unitario"]), Decimal("1900.00"))
+        self.assertEqual(Decimal(detalle_barra["subtotal"]), Decimal("5700.00"))
+        self.assertTrue(pedido_por_id[pedido_barra.pk]["agregado_por_barra"])
+        self.assertEqual(pedido_por_id[pedido_barra.pk]["autor_id"], self.usuario_barra.pk)
+        self.assertEqual(pedido_por_id[pedido_barra.pk]["autor_nombre"], "consumo_barra")
+        self.assertEqual(Decimal(response.data["total"]), Decimal("8100.00"))
+
+    def test_incluye_producto_inactivo_con_nombre_y_precio_snapshot(self):
+        pedido = self.crear_pedido(self.mozo, cantidad=2)
+        self.producto.precio = Decimal("2500.00")
+        self.producto.activo = False
+        self.producto.save()
+
+        response = self.consultar_como(self.mozo)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        detalle = response.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(response.data["pedidos"][0]["id"], pedido.pk)
+        self.assertEqual(detalle["producto"], self.producto.pk)
+        self.assertEqual(detalle["producto_nombre"], "Limonada consumo")
+        self.assertEqual(Decimal(detalle["precio_unitario"]), Decimal("1200.00"))
+        self.assertEqual(Decimal(detalle["subtotal"]), Decimal("2400.00"))
+
+    def test_cuenta_cerrada_y_nueva_cuenta_de_la_misma_mesa_quedan_separadas(self):
+        pedido_anterior = self.crear_pedido(self.mozo)
+        self.cuenta.cerrar()
+        cuenta_nueva = Cuenta.objects.create(
+            mesa=self.mesa,
+            mozo_responsable=self.otro_mozo,
+        )
+        Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=cuenta_nueva,
+            mozo=self.otro_mozo,
+            creado_por=self.otro_mozo,
+        )
+        DetallePedido.objects.create(
+            pedido=cuenta_nueva.pedidos.get(),
+            producto=self.producto,
+            cantidad=4,
+        )
+
+        self.client.force_authenticate(user=self.usuario_barra)
+        self.assertEqual(self.client.get(self.url).status_code, status.HTTP_404_NOT_FOUND)
+        self.url = reverse("cuenta-consumo", args=[cuenta_nueva.pk])
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["pedidos"]), 1)
+        self.assertNotEqual(response.data["pedidos"][0]["id"], pedido_anterior.pk)
+        self.assertEqual(Decimal(response.data["total"]), Decimal("4800.00"))
+
+    def test_cuenta_inexistente_devuelve_not_found(self):
+        self.client.force_authenticate(user=self.usuario_barra)
+
+        response = self.client.get(
+            reverse("cuenta-consumo", args=[self.cuenta.pk + 1000]),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_cuenta_abierta_vacia_es_consultable_por_barra_y_total_es_cero(self):
+        response = self.consultar_como(self.usuario_barra)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["pedidos"], [])
+        self.assertEqual(Decimal(response.data["total"]), Decimal("0.00"))
+
+    def test_pedido_historico_sin_creado_por_usa_el_mozo_como_autor(self):
+        pedido = Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=self.cuenta,
+            mozo=self.mozo,
+            creado_por=None,
+        )
+        DetallePedido.objects.create(
+            pedido=pedido,
+            producto=self.producto,
+            cantidad=1,
+        )
+
+        response = self.consultar_como(self.mozo)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["pedidos"][0]["autor_id"], self.mozo.pk)
+        self.assertEqual(response.data["pedidos"][0]["autor_nombre"], "Ana Gomez")
+
+    def test_responsable_sin_nombre_usa_username(self):
+        self.mozo.first_name = ""
+        self.mozo.last_name = ""
+        self.mozo.save()
+
+        response = self.consultar_como(self.mozo)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["responsable"],
+            {"id": self.mozo.pk, "nombre": "consumo_mozo"},
+        )
+
+    def test_solo_mozo_responsable_y_barra_pueden_consultar_consumo(self):
+        self.crear_pedido(self.mozo, cantidad=3)
+
+        response_responsable = self.consultar_como(self.mozo)
+        response_otro_mozo = self.consultar_como(self.otro_mozo)
+
+        self.assertEqual(response_responsable.status_code, status.HTTP_200_OK)
+        self.assertEqual(response_otro_mozo.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertNotIn("pedidos", response_otro_mozo.data)
+        self.assertEqual(
+            self.consultar_como(self.usuario_barra).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_sin_responsable_solo_barra_puede_consultar(self):
+        self.cuenta.mozo_responsable = None
+        self.cuenta.save(update_fields=["mozo_responsable"])
+
+        self.assertEqual(
+            self.consultar_como(self.mozo).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        response_barra = self.consultar_como(self.usuario_barra)
+        self.assertEqual(response_barra.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response_barra.data["responsable"])
+        self.assertEqual(response_barra.data["pedidos"], [])
+
+        self.client.force_authenticate(user=self.usuario_barra)
+        carga = self.client.post(
+            reverse("barra-carga-create"),
+            {
+                "mesa": self.mesa.pk,
+                "cuenta": self.cuenta.pk,
+                "detalles": [
+                    {"producto": self.producto.pk, "cantidad": 1},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(carga.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(self.cuenta.pedidos.exists())
+
+    def test_administrador_cocina_y_anonimos_no_pueden_consultar(self):
+        for usuario in [self.admin, self.cocina]:
+            with self.subTest(rol=usuario.rol):
+                self.assertEqual(
+                    self.consultar_como(usuario).status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+        self.client.force_authenticate(user=None)
+        response = self.client.get(self.url)
+        self.assertIn(
+            response.status_code,
+            {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN},
+        )
+
+    def test_carga_barra_se_identifica_por_aviso_aunque_cambie_rol_del_autor(self):
+        pedido = self.crear_pedido(self.usuario_barra, cantidad=2)
+        User.objects.filter(pk=self.usuario_barra.pk).update(
+            rol=User.Rol.ADMINISTRADOR,
+        )
+
+        response = self.consultar_como(self.mozo)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        pedido_data = response.data["pedidos"][0]
+        self.assertEqual(pedido_data["id"], pedido.pk)
+        self.assertTrue(pedido_data["agregado_por_barra"])
+        self.assertEqual(pedido_data["autor_id"], self.usuario_barra.pk)
+        self.assertEqual(pedido_data["autor_nombre"], "consumo_barra")
+
+
+class SolicitudCancelacionDetalleAPITests(APITestCase):
+    def setUp(self):
+        self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        self.barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.pizza = Sector.objects.create(nombre=Sector.Nombre.PIZZA)
+        self.platos = Sector.objects.create(nombre=Sector.Nombre.PLATOS)
+        self.mozo = User.objects.create_user(
+            username="cancelacion_mozo",
+            password="ClaveSoloParaTests-2026",
+            first_name="María",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.otro_mozo = User.objects.create_user(
+            username="cancelacion_otro_mozo",
+            password="ClaveSoloParaTests-2026",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.barra_user = User.objects.create_user(
+            username="cancelacion_barra",
+            password="ClaveSoloParaTests-2026",
+            rol=User.Rol.BARRA,
+            sector=self.barra,
+        )
+        self.cocina_pizza = User.objects.create_user(
+            username="cancelacion_pizza",
+            password="ClaveSoloParaTests-2026",
+            rol=User.Rol.COCINA,
+            sector=self.pizza,
+        )
+        self.cocina_platos = User.objects.create_user(
+            username="cancelacion_platos",
+            password="ClaveSoloParaTests-2026",
+            rol=User.Rol.COCINA,
+            sector=self.platos,
+        )
+        self.admin = User.objects.create_user(
+            username="cancelacion_admin",
+            password="ClaveSoloParaTests-2026",
+            rol=User.Rol.ADMINISTRADOR,
+        )
+        self.mesa = Mesa.objects.create(numero=91, zona=Mesa.Zona.SALON)
+        self.cuenta = Cuenta.objects.create(
+            mesa=self.mesa,
+            mozo_responsable=self.mozo,
+        )
+        self.categoria = Categoria.objects.create(nombre="Cancelaciones")
+        self.producto = Producto.objects.create(
+            nombre="Bebida para cancelar",
+            precio=Decimal("1200.00"),
+            categoria=self.categoria,
+            sector_destino=self.barra,
+        )
+        self.pedido = Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=self.cuenta,
+            mozo=self.mozo,
+            creado_por=self.mozo,
+        )
+        self.detalle = DetallePedido.objects.create(
+            pedido=self.pedido,
+            producto=self.producto,
+            cantidad=4,
+        )
+        self.solicitar_url = reverse(
+            "detalle-solicitar-cancelacion",
+            args=[self.cuenta.pk, self.detalle.pk],
+        )
+        self.consumo_url = reverse("cuenta-consumo", args=[self.cuenta.pk])
+        self.pendientes_url = reverse("cancelacion-pendiente-list")
+        self.notificaciones_url = reverse("cancelacion-notificacion-list")
+
+    def solicitar(
+        self,
+        cantidad=1,
+        motivo="El cliente cambió de opinión",
+        clave_idempotencia=None,
+    ):
+        return self.client.post(
+            self.solicitar_url,
+            {
+                "clave_idempotencia": clave_idempotencia or uuid4(),
+                "cantidad": cantidad,
+                "motivo": motivo,
+            },
+            format="json",
+        )
+
+    def resolver(self, solicitud_id, usuario, estado):
+        self.client.force_authenticate(user=usuario)
+        return self.client.post(
+            reverse("cancelacion-resolver", args=[solicitud_id]),
+            {"estado": estado},
+            format="json",
+        )
+
+    def consultar_consumo(self):
+        self.client.force_authenticate(user=self.mozo)
+        return self.client.get(self.consumo_url)
+
+    def test_solo_mozo_responsable_puede_solicitar_cancelacion(self):
+        for usuario in [
+            self.otro_mozo,
+            self.barra_user,
+            self.cocina_pizza,
+            self.admin,
+        ]:
+            with self.subTest(rol=usuario.rol, usuario=usuario.username):
+                self.client.force_authenticate(user=usuario)
+                response = self.solicitar()
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=None)
+        response = self.solicitar()
+        self.assertIn(
+            response.status_code,
+            {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN},
+        )
+        self.client.force_authenticate(user=self.mozo)
+        response = self.solicitar()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            response.data["solicitante_nombre"],
+            "María",
+        )
+
+        self.cuenta.mozo_responsable = None
+        self.cuenta.save(update_fields=["mozo_responsable"])
+        self.client.force_authenticate(user=self.mozo)
+        unassigned = self.solicitar()
+        self.assertEqual(unassigned.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_cantidad_positiva_motivo_obligatorio_y_reserva_pendiente(self):
+        self.client.force_authenticate(user=self.mozo)
+        clave_idempotencia = uuid4()
+        for payload in [
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 0,
+                "motivo": "Inválido",
+            },
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "   ",
+            },
+        ]:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    self.solicitar_url,
+                    payload,
+                    format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        pending = self.solicitar(
+            cantidad=3,
+            clave_idempotencia=clave_idempotencia,
+        )
+        self.assertEqual(pending.status_code, status.HTTP_201_CREATED)
+        excessive = self.solicitar(
+            cantidad=2,
+            clave_idempotencia=uuid4(),
+        )
+        self.assertEqual(excessive.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.consultar_consumo()
+        detail = response.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["cantidad"], 4)
+        self.assertEqual(detail["cantidad_cancelada"], 0)
+        self.assertEqual(detail["cantidad_vigente"], 4)
+        self.assertEqual(detail["cantidad_pendiente"], 3)
+        self.assertEqual(detail["cantidad_disponible_cancelacion"], 1)
+        self.assertEqual(Decimal(detail["subtotal"]), Decimal("4800.00"))
+        self.assertEqual(Decimal(response.data["total"]), Decimal("4800.00"))
+
+    def test_repetir_misma_clave_devuelve_solicitud_existente_sin_reservar_dos_veces(self):
+        self.client.force_authenticate(user=self.mozo)
+        clave_idempotencia = uuid4()
+        first = self.solicitar(
+            cantidad=2,
+            clave_idempotencia=clave_idempotencia,
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+
+        repeated = self.solicitar(
+            cantidad=2,
+            clave_idempotencia=clave_idempotencia,
+        )
+
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+        self.assertEqual(repeated.data["id"], first.data["id"])
+        self.assertEqual(
+            repeated.data["clave_idempotencia"],
+            str(clave_idempotencia),
+        )
+        self.assertEqual(
+            SolicitudCancelacionDetalle.objects.filter(
+                clave_idempotencia=clave_idempotencia,
+            ).count(),
+            1,
+        )
+        consumption = self.consultar_consumo()
+        detail = consumption.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["cantidad_pendiente"], 2)
+        self.assertEqual(detail["cantidad_disponible_cancelacion"], 2)
+
+    def test_reutilizar_clave_con_datos_diferentes_devuelve_conflicto(self):
+        self.client.force_authenticate(user=self.mozo)
+        clave_idempotencia = uuid4()
+        created = self.solicitar(
+            cantidad=1,
+            motivo="Motivo original",
+            clave_idempotencia=clave_idempotencia,
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+
+        for payload in [
+            {
+                "clave_idempotencia": clave_idempotencia,
+                "cantidad": 2,
+                "motivo": "Motivo original",
+            },
+            {
+                "clave_idempotencia": clave_idempotencia,
+                "cantidad": 1,
+                "motivo": "Otro motivo",
+            },
+        ]:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    self.solicitar_url,
+                    payload,
+                    format="json",
+                )
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_409_CONFLICT,
+                )
+
+        self.assertEqual(
+            SolicitudCancelacionDetalle.objects.filter(
+                clave_idempotencia=clave_idempotencia,
+            ).count(),
+            1,
+        )
+
+    def test_aceptacion_descuenta_snapshot_y_resolucion_repetida_no_repite(self):
+        self.producto.precio = Decimal("2500.00")
+        self.producto.save()
+        self.client.force_authenticate(user=self.mozo)
+        response = self.solicitar(cantidad=2)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        solicitud_id = response.data["id"]
+
+        wrong_sector = self.resolver(
+            solicitud_id,
+            self.cocina_pizza,
+            SolicitudCancelacionDetalle.Estado.ACEPTADA,
+        )
+        self.assertEqual(wrong_sector.status_code, status.HTTP_404_NOT_FOUND)
+
+        accepted = self.resolver(
+            solicitud_id,
+            self.barra_user,
+            SolicitudCancelacionDetalle.Estado.ACEPTADA,
+        )
+        self.assertEqual(accepted.status_code, status.HTTP_200_OK)
+        self.assertEqual(accepted.data["estado"], "ACEPTADA")
+        self.assertEqual(accepted.data["resuelto_por_id"], self.barra_user.pk)
+        self.assertIsNotNone(accepted.data["fecha_resolucion"])
+
+        self.client.force_authenticate(user=self.mozo)
+        excessive = self.solicitar(cantidad=3)
+        self.assertEqual(excessive.status_code, status.HTTP_400_BAD_REQUEST)
+
+        repeated = self.resolver(
+            solicitud_id,
+            self.barra_user,
+            SolicitudCancelacionDetalle.Estado.ACEPTADA,
+        )
+        self.assertEqual(repeated.status_code, status.HTTP_404_NOT_FOUND)
+        response = self.consultar_consumo()
+        detail = response.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["cantidad"], 4)
+        self.assertEqual(detail["cantidad_cancelada"], 2)
+        self.assertEqual(detail["cantidad_vigente"], 2)
+        self.assertEqual(Decimal(detail["precio_unitario"]), Decimal("1200.00"))
+        self.assertEqual(Decimal(detail["subtotal_original"]), Decimal("4800.00"))
+        self.assertEqual(Decimal(detail["subtotal"]), Decimal("2400.00"))
+        self.assertEqual(Decimal(response.data["total"]), Decimal("2400.00"))
+        self.detalle.refresh_from_db()
+        self.assertEqual(self.detalle.cantidad, 4)
+        self.assertEqual(self.detalle.precio_unitario, Decimal("1200.00"))
+
+    def test_nueva_resolucion_rechazada_se_rechaza_y_historico_se_conserva(self):
+        self.client.force_authenticate(user=self.mozo)
+        response = self.solicitar(cantidad=2)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        rejected = self.resolver(
+            response.data["id"],
+            self.barra_user,
+            SolicitudCancelacionDetalle.Estado.RECHAZADA,
+        )
+        self.assertEqual(rejected.status_code, status.HTTP_400_BAD_REQUEST)
+        solicitud_historica = SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Registro histórico rechazado",
+            estado=SolicitudCancelacionDetalle.Estado.RECHAZADA,
+            resuelto_por=self.barra_user,
+        )
+
+        consumption = self.consultar_consumo()
+        detail = consumption.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["cantidad_cancelada"], 0)
+        self.assertEqual(detail["cantidad_vigente"], 4)
+        self.assertEqual(Decimal(consumption.data["total"]), Decimal("4800.00"))
+        estados = {
+            solicitud["estado"]
+            for solicitud in detail["solicitudes_cancelacion"]
+        }
+        self.assertIn("PENDIENTE", estados)
+        self.assertIn("RECHAZADA", estados)
+        self.assertEqual(
+            next(
+                solicitud["id"]
+                for solicitud in detail["solicitudes_cancelacion"]
+                if solicitud["estado"] == "RECHAZADA"
+            ),
+            solicitud_historica.pk,
+        )
+
+    def test_notificaciones_solo_exponen_sector_o_solicitudes_propias(self):
+        self.client.force_authenticate(user=self.mozo)
+        propia = self.solicitar()
+        producto_pizza = Producto.objects.create(
+            nombre="Pizza para notificar",
+            precio=Decimal("2000.00"),
+            categoria=self.categoria,
+            sector_destino=self.pizza,
+        )
+        detalle_pizza = DetallePedido.objects.create(
+            pedido=self.pedido,
+            producto=producto_pizza,
+            cantidad=2,
+        )
+        pizza_request = self.client.post(
+            reverse(
+                "detalle-solicitar-cancelacion",
+                args=[self.cuenta.pk, detalle_pizza.pk],
+            ),
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "Notificar a pizza",
+            },
+            format="json",
+        )
+        self.assertEqual(pizza_request.status_code, status.HTTP_201_CREATED)
+        historica = SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Resultado visible en notificaciones",
+            estado=SolicitudCancelacionDetalle.Estado.RECHAZADA,
+            resuelto_por=self.barra_user,
+        )
+
+        otra_mesa = Mesa.objects.create(numero=92, zona=Mesa.Zona.SALON)
+        otra_cuenta = Cuenta.objects.create(
+            mesa=otra_mesa,
+            mozo_responsable=self.otro_mozo,
+        )
+        otro_pedido = Pedido.objects.create(
+            mesa=otra_mesa,
+            cuenta=otra_cuenta,
+            mozo=self.otro_mozo,
+            creado_por=self.otro_mozo,
+        )
+        otro_detalle = DetallePedido.objects.create(
+            pedido=otro_pedido,
+            producto=self.producto,
+            cantidad=2,
+        )
+        self.client.force_authenticate(user=self.otro_mozo)
+        ajena = self.client.post(
+            reverse(
+                "detalle-solicitar-cancelacion",
+                args=[otra_cuenta.pk, otro_detalle.pk],
+            ),
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "Solicitud de otra persona",
+            },
+            format="json",
+        )
+        self.assertEqual(ajena.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.mozo)
+        propias = self.client.get(self.notificaciones_url)
+        self.assertEqual(propias.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {item["id"] for item in propias.data},
+            {propia.data["id"], pizza_request.data["id"], historica.pk},
+        )
+        self.assertTrue(
+            all(item["solicitante_id"] == self.mozo.pk for item in propias.data),
+        )
+        self.assertTrue(
+            all(item["fecha_solicitud"] for item in propias.data),
+        )
+        self.assertTrue(
+            all(item["motivo"] for item in propias.data),
+        )
+
+        self.client.force_authenticate(user=self.barra_user)
+        barra = self.client.get(self.notificaciones_url)
+        self.assertEqual(barra.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {item["id"] for item in barra.data},
+            {propia.data["id"], ajena.data["id"], historica.pk},
+        )
+        self.assertIn(
+            "RECHAZADA",
+            {
+                item["estado"]
+                for item in barra.data
+                if item["id"] == historica.pk
+            },
+        )
+        self.assertTrue(
+            all(item["zona"] == "Salón" for item in barra.data),
+        )
+
+        for usuario in [self.cocina_pizza, self.cocina_platos]:
+            with self.subTest(rol=usuario.rol, sector=usuario.sector.nombre):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.get(self.notificaciones_url)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                expected = (
+                    {pizza_request.data["id"]}
+                    if usuario == self.cocina_pizza
+                    else set()
+                )
+                self.assertEqual(
+                    {item["id"] for item in response.data},
+                    expected,
+                )
+
+        self.client.force_authenticate(user=self.otro_mozo)
+        otra_respuesta = self.client.get(self.notificaciones_url)
+        self.assertEqual(otra_respuesta.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {item["id"] for item in otra_respuesta.data},
+            {ajena.data["id"]},
+        )
+
+        self.client.force_authenticate(user=self.admin)
+        admin_response = self.client.get(self.notificaciones_url)
+        self.assertEqual(admin_response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=None)
+        response = self.client.get(self.notificaciones_url)
+        self.assertIn(
+            response.status_code,
+            {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN},
+        )
+
+    def test_mozo_ve_resultado_historico_solo_de_sus_solicitudes(self):
+        historica = SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Historial propio",
+            estado=SolicitudCancelacionDetalle.Estado.RECHAZADA,
+            resuelto_por=self.barra_user,
+        )
+        otra_mesa = Mesa.objects.create(numero=93, zona=Mesa.Zona.VEREDA_A)
+        otra_cuenta = Cuenta.objects.create(
+            mesa=otra_mesa,
+            mozo_responsable=self.otro_mozo,
+        )
+        otro_pedido = Pedido.objects.create(
+            mesa=otra_mesa,
+            cuenta=otra_cuenta,
+            mozo=self.otro_mozo,
+            creado_por=self.otro_mozo,
+        )
+        otro_detalle = DetallePedido.objects.create(
+            pedido=otro_pedido,
+            producto=self.producto,
+            cantidad=2,
+        )
+        solicitud_ajena = SolicitudCancelacionDetalle.objects.create(
+            detalle=otro_detalle,
+            solicitante=self.otro_mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Historial privado",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.barra_user,
+        )
+
+        self.client.force_authenticate(user=self.mozo)
+        response = self.client.get(self.notificaciones_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], historica.pk)
+        self.assertEqual(response.data[0]["estado"], "RECHAZADA")
+        self.assertNotEqual(response.data[0]["id"], solicitud_ajena.pk)
+
+    def test_pendientes_se_filtran_por_sector_destino_guardado(self):
+        producto_pizza = Producto.objects.create(
+            nombre="Pizza para cancelar",
+            precio=Decimal("1800.00"),
+            categoria=self.categoria,
+            sector_destino=self.pizza,
+        )
+        detalle_pizza = DetallePedido.objects.create(
+            pedido=self.pedido,
+            producto=producto_pizza,
+            cantidad=2,
+        )
+        producto_pizza.sector_destino = self.platos
+        producto_pizza.save(update_fields=["sector_destino"])
+        self.client.force_authenticate(user=self.mozo)
+        self.assertEqual(self.solicitar().status_code, status.HTTP_201_CREATED)
+        pizza_url = reverse(
+            "detalle-solicitar-cancelacion",
+            args=[self.cuenta.pk, detalle_pizza.pk],
+        )
+        self.assertEqual(
+            self.client.post(
+                pizza_url,
+                {
+                    "clave_idempotencia": uuid4(),
+                    "cantidad": 1,
+                    "motivo": "Pedido equivocado",
+                },
+                format="json",
+            ).status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        self.client.force_authenticate(user=self.barra_user)
+        barra_items = self.client.get(self.pendientes_url)
+        self.assertEqual(barra_items.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(barra_items.data), 1)
+        self.assertEqual(barra_items.data[0]["producto_nombre"], "Bebida para cancelar")
+
+        self.client.force_authenticate(user=self.cocina_pizza)
+        pizza_items = self.client.get(self.pendientes_url)
+        self.assertEqual(pizza_items.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(pizza_items.data), 1)
+        self.assertEqual(pizza_items.data[0]["producto_nombre"], "Pizza para cancelar")
+
+        self.client.force_authenticate(user=self.cocina_platos)
+        platos_items = self.client.get(self.pendientes_url)
+        self.assertEqual(platos_items.status_code, status.HTTP_200_OK)
+        self.assertEqual(platos_items.data, [])
+
+        for usuario in [self.mozo, self.admin]:
+            with self.subTest(rol=usuario.rol):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.get(self.pendientes_url)
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+    def test_cuenta_cerrada_no_admite_solicitud_ni_resolucion_y_nueva_cuenta_aislada(self):
+        self.client.force_authenticate(user=self.mozo)
+        pending = self.solicitar(cantidad=1)
+        self.assertEqual(pending.status_code, status.HTTP_201_CREATED)
+        solicitud_id = pending.data["id"]
+
+        self.cuenta.cerrar()
+        rejected_request = self.solicitar(cantidad=1)
+        self.assertEqual(rejected_request.status_code, status.HTTP_404_NOT_FOUND)
+        rejected_resolution = self.resolver(
+            solicitud_id,
+            self.barra_user,
+            SolicitudCancelacionDetalle.Estado.ACEPTADA,
+        )
+        self.assertEqual(
+            rejected_resolution.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        nueva_cuenta = Cuenta.objects.create(
+            mesa=self.mesa,
+            mozo_responsable=self.otro_mozo,
+        )
+        nuevo_pedido = Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=nueva_cuenta,
+            mozo=self.otro_mozo,
+            creado_por=self.otro_mozo,
+        )
+        DetallePedido.objects.create(
+            pedido=nuevo_pedido,
+            producto=self.producto,
+            cantidad=2,
+        )
+        self.client.force_authenticate(user=self.otro_mozo)
+        mismatched_detail_url = reverse(
+            "detalle-solicitar-cancelacion",
+            args=[nueva_cuenta.pk, self.detalle.pk],
+        )
+        mismatched_detail = self.client.post(
+            mismatched_detail_url,
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "Detalle de otra cuenta",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            mismatched_detail.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        response = self.client.get(
+            reverse("cuenta-consumo", args=[nueva_cuenta.pk]),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        detail = response.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["cantidad_cancelada"], 0)
+        self.assertEqual(detail["solicitudes_cancelacion"], [])
+        self.assertEqual(Decimal(response.data["total"]), Decimal("2400.00"))

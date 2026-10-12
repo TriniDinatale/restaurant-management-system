@@ -1,0 +1,50 @@
+<div class="notification-bell">
+    <button
+        id="notification-toggle"
+        class="button button-quiet notification-toggle"
+        type="button"
+        aria-expanded="false"
+        aria-controls="notification-panel"
+        aria-label="Notificaciones"
+    >
+        <svg class="notification-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"></path>
+        </svg>
+        <span>Notificaciones</span>
+        <span id="notification-count" class="notification-count" hidden>0</span>
+    </button>
+    <span
+        id="notification-sync-error"
+        class="notification-sync-error"
+        role="status"
+        aria-live="polite"
+        hidden
+    ></span>
+    <section
+        id="notification-panel"
+        class="notification-panel"
+        aria-label="Notificaciones"
+        hidden
+        inert
+    >
+        <div class="notification-panel-heading">
+            <h2>Notificaciones</h2>
+            <button
+                id="notification-close"
+                class="button button-quiet notification-close"
+                type="button"
+                aria-label="Cerrar notificaciones"
+            >
+                Cerrar
+            </button>
+        </div>
+        <p
+            id="notification-error"
+            class="notification-error"
+            role="status"
+            aria-live="polite"
+            hidden
+        ></p>
+        <div id="notification-list" class="notification-list"></div>
+    </section>
+</div>
