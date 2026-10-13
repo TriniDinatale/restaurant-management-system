@@ -187,10 +187,23 @@ class Pedido(models.Model):
         ).exists()
 
     def preparaciones_listas_para_retiro(self):
-        preparaciones = list(self.preparaciones_sectoriales.all())
-        return bool(preparaciones) and all(
-            preparacion.estado == PreparacionPedidoSector.Estado.LISTO
-            for preparacion in preparaciones
+        if not self.detalles.exists():
+            return False
+
+        incluye_barra = self.detalles.filter(
+            sector_destino__nombre=Sector.Nombre.BARRA,
+        ).exists()
+        if not incluye_barra:
+            return True
+
+        preparaciones_barra = self.preparaciones_sectoriales.filter(
+            sector__nombre=Sector.Nombre.BARRA,
+        )
+        return (
+            preparaciones_barra.exists()
+            and not preparaciones_barra.exclude(
+                estado=PreparacionPedidoSector.Estado.LISTO,
+            ).exists()
         )
 
     @property
@@ -214,7 +227,7 @@ class Pedido(models.Model):
 
         if not pedido.preparaciones_listas_para_retiro():
             raise ValidationError(
-                "Todas las preparaciones deben estar listas para habilitar el retiro."
+                "Los productos de Barra deben estar listos para habilitar el retiro."
             )
 
         fecha_habilitacion = timezone.now()

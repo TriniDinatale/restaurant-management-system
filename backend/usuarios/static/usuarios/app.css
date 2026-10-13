@@ -907,6 +907,41 @@ h2 {
     margin: 0;
 }
 
+.bar-retirements {
+    display: grid;
+    gap: 14px;
+    margin-top: 32px;
+}
+
+.bar-retirements-heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.bar-retirements-heading h2,
+.bar-retirements-heading p {
+    margin: 0;
+}
+
+.bar-retirement-list {
+    display: grid;
+    gap: 14px;
+}
+
+.bar-retirement-products {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding-left: 22px;
+}
+
+.bar-retirement-products li {
+    padding-left: 2px;
+}
+
 .cancellation-card-header {
     display: flex;
     align-items: center;

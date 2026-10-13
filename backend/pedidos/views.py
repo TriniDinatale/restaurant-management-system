@@ -507,11 +507,19 @@ class ControlRetiroBarraListView(generics.ListAPIView):
     def get_queryset(self):
         return (
             Pedido.objects.filter(
-                preparaciones_sectoriales__isnull=False,
+                retiro_habilitado_en__isnull=True,
+                detalles__sector_destino__nombre__in={
+                    Sector.Nombre.PIZZA,
+                    Sector.Nombre.PLATOS,
+                },
             )
             .distinct()
             .select_related("mesa", "mozo")
-            .prefetch_related("preparaciones_sectoriales__sector")
+            .prefetch_related(
+                "detalles__producto",
+                "detalles__sector_destino",
+                "preparaciones_sectoriales__sector",
+            )
         )
 
 

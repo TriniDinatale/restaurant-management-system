@@ -33,6 +33,34 @@
     <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
     <p id="loading-message" class="loading-message" role="status">Cargando mesas y cuentas…</p>
     <div id="zones" class="zones" aria-live="polite"></div>
+    <section
+        id="bar-retirements"
+        class="bar-retirements"
+        aria-labelledby="bar-retirements-title"
+        hidden
+    >
+        <div class="bar-retirements-heading">
+            <div>
+                <p class="eyebrow">RETIRO</p>
+                <h2 id="bar-retirements-title">Pedidos pendientes de Cocina</h2>
+                <p class="intro">
+                    Confirmá que recibiste y revisaste los productos antes de avisar al mozo.
+                </p>
+            </div>
+            <button
+                id="bar-retirements-refresh"
+                class="button button-secondary"
+                type="button"
+            >
+                Actualizar retiros
+            </button>
+        </div>
+        <p id="bar-retirements-message" class="message" role="status" aria-live="polite" hidden></p>
+        <p id="bar-retirements-loading" class="loading-message" role="status" hidden>
+            Cargando retiros pendientes…
+        </p>
+        <div id="bar-retirements-list" class="bar-retirement-list" aria-live="polite"></div>
+    </section>
 </main>
 <div id="account-overlay" class="account-overlay" hidden>
     <section

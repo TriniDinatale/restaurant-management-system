@@ -2263,12 +2263,14 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(aviso.mensaje, "Vereda A · Mesa 47")
         self.assertNotEqual(pedido.mesa_id, pedido.mesa.numero)
 
-    def test_kitchen_only_order_waits_for_bar_confirmation(self):
-        pedido, preparaciones = self.crear_pedido([self.pizza], 48)
-        self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
+    def test_kitchen_only_order_can_be_manually_confirmed_while_preparations_are_pending(self):
+        pedido, preparaciones = self.crear_pedido(
+            [self.pizza, self.platos],
+            48,
+        )
 
         pedido.refresh_from_db()
-        self.assertTrue(pedido.cocina_lista)
+        self.assertFalse(pedido.cocina_lista)
         self.assertIsNone(pedido.retiro_habilitado_en)
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
@@ -2283,8 +2285,31 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(response.data[0]["mozo_id"], self.mozo.pk)
         self.assertEqual(response.data[0]["mozo_nombre"], "Ana Gomez")
         self.assertEqual(
+            response.data[0]["productos_cocina"],
+            [
+                {
+                    "producto_nombre": f"Producto {Sector.Nombre.PIZZA} mesa 48",
+                    "cantidad": 1,
+                    "sector": Sector.Nombre.PIZZA,
+                },
+                {
+                    "producto_nombre": f"Producto {Sector.Nombre.PLATOS} mesa 48",
+                    "cantidad": 1,
+                    "sector": Sector.Nombre.PLATOS,
+                },
+            ],
+        )
+        self.assertNotIn("precio_unitario", response.data[0])
+        self.assertNotIn(
+            "precio_unitario",
+            response.data[0]["productos_cocina"][0],
+        )
+        self.assertEqual(
             response.data[0]["estados_sectores"],
-            [{"sector": Sector.Nombre.PIZZA, "estado": "LISTO"}],
+            [
+                {"sector": Sector.Nombre.PIZZA, "estado": "PENDIENTE"},
+                {"sector": Sector.Nombre.PLATOS, "estado": "PENDIENTE"},
+            ],
         )
         self.assertTrue(response.data[0]["puede_habilitar_retiro"])
 
@@ -2292,23 +2317,50 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(confirmation.status_code, status.HTTP_200_OK)
         pedido.refresh_from_db()
         self.assertEqual(pedido.retiro_habilitado_por, self.usuario_barra)
+        for preparacion in preparaciones.values():
+            preparacion.refresh_from_db()
+            self.assertEqual(
+                preparacion.estado,
+                PreparacionPedidoSector.Estado.PENDIENTE,
+            )
+        self.assertEqual(self.client.get(self.control_url).data, [])
+        aviso = AvisoRetiro.objects.get(pedido=pedido)
+        self.assertEqual(aviso.mensaje, "Salón · Mesa 48")
 
-    def test_bar_ready_before_kitchen_does_not_create_early_notice(self):
+    def test_mixed_order_requires_barra_ready_but_not_digital_kitchen_readiness(self):
         pedido, preparaciones = self.crear_pedido(
             [self.barra, self.pizza],
             49,
         )
 
+        self.client.force_authenticate(user=self.usuario_barra)
+        pending_items = self.client.get(self.control_url)
+        self.assertEqual(len(pending_items.data), 1)
+        self.assertFalse(pending_items.data[0]["puede_habilitar_retiro"])
+        self.assertEqual(
+            pending_items.data[0]["productos_cocina"][0]["sector"],
+            Sector.Nombre.PIZZA,
+        )
+        premature_confirmation = self.confirmar_retiro(pedido)
+        self.assertEqual(
+            premature_confirmation.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        pedido.refresh_from_db()
+        self.assertIsNone(pedido.retiro_habilitado_en)
+        self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
+
         self.marcar_lista(preparaciones[Sector.Nombre.BARRA])
-
         pedido.refresh_from_db()
         self.assertIsNone(pedido.retiro_habilitado_en)
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
-
-        self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
-        pedido.refresh_from_db()
-        self.assertIsNone(pedido.retiro_habilitado_en)
-        self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
+        preparacion_cocina = preparaciones[Sector.Nombre.PIZZA]
+        preparacion_cocina.refresh_from_db()
+        self.assertEqual(
+            preparacion_cocina.estado,
+            PreparacionPedidoSector.Estado.PENDIENTE,
+        )
 
         response = self.confirmar_retiro(pedido)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -2316,29 +2368,30 @@ class RetiroPedidoAPITests(APITestCase):
             AvisoRetiro.objects.get(pedido=pedido).mensaje,
             "Salón · Mesa 49",
         )
+        self.assertEqual(self.client.get(self.control_url).data, [])
 
-    def test_pizza_and_platos_must_both_be_ready_before_confirmation(self):
+    def test_kitchen_only_products_from_both_sectors_do_not_require_digital_readiness(self):
         pedido, preparaciones = self.crear_pedido(
             [self.pizza, self.platos],
             50,
         )
-        self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
 
         response = self.confirmar_retiro(pedido)
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         pedido.refresh_from_db()
         self.assertFalse(pedido.cocina_lista)
-        self.assertIsNone(pedido.retiro_habilitado_en)
-        self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
+        self.assertIsNotNone(pedido.retiro_habilitado_en)
+        self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
+        self.assertTrue(
+            all(
+                preparacion.estado == PreparacionPedidoSector.Estado.PENDIENTE
+                for preparacion in preparaciones.values()
+            ),
+        )
 
-        self.marcar_lista(preparaciones[Sector.Nombre.PLATOS])
-        self.assertTrue(pedido.cocina_lista)
-        response = self.confirmar_retiro(pedido)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-    def test_premature_confirmation_changes_nothing(self):
-        pedido, _ = self.crear_pedido([self.pizza], 51)
+    def test_mixed_order_with_barra_pending_cannot_be_confirmed(self):
+        pedido, _ = self.crear_pedido([self.barra, self.pizza], 51)
 
         response = self.confirmar_retiro(pedido)
 
@@ -2348,8 +2401,19 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertIsNone(pedido.retiro_habilitado_por_id)
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
+    def test_kitchen_only_order_does_not_require_digital_preparation_records(self):
+        pedido, _ = self.crear_pedido([self.pizza], 52)
+        pedido.preparaciones_sectoriales.all().delete()
+
+        response = self.confirmar_retiro(pedido)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        pedido.refresh_from_db()
+        self.assertIsNotNone(pedido.retiro_habilitado_en)
+        self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
+
     def test_order_without_preparations_cannot_be_enabled_or_listed(self):
-        pedido, _ = self.crear_pedido([], 52)
+        pedido, _ = self.crear_pedido([], 53)
 
         response = self.confirmar_retiro(pedido)
 
@@ -2360,8 +2424,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
     def test_repeated_confirmation_preserves_original_bar_user_and_timestamp(self):
-        pedido, preparaciones = self.crear_pedido([self.pizza], 53)
-        self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
+        pedido, _ = self.crear_pedido([self.pizza], 54)
         first_response = self.confirmar_retiro(pedido)
         self.assertEqual(first_response.status_code, status.HTTP_200_OK)
 
@@ -2369,6 +2432,7 @@ class RetiroPedidoAPITests(APITestCase):
         aviso = AvisoRetiro.objects.get(pedido=pedido)
         fecha_original = pedido.retiro_habilitado_en
         fecha_aviso_original = aviso.fecha_creacion
+        self.assertEqual(self.client.get(self.control_url).data, [])
         otro_usuario = self.otra_barra
         second_response = self.confirmar_retiro(pedido, otro_usuario)
 
@@ -2381,7 +2445,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
 
     def test_confirming_after_account_closes_does_not_revalidate_order_creation(self):
-        pedido, preparaciones = self.crear_pedido([self.pizza], 54)
+        pedido, preparaciones = self.crear_pedido([self.pizza], 55)
         self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
         pedido.cuenta.cerrar()
 
@@ -2392,7 +2456,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertIsNotNone(pedido.retiro_habilitado_en)
 
     def test_notice_failure_rolls_back_retiro_habilitation(self):
-        pedido, preparaciones = self.crear_pedido([self.pizza], 55)
+        pedido, preparaciones = self.crear_pedido([self.pizza], 56)
         self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
         self.client.force_authenticate(user=self.usuario_barra)
 
@@ -2408,7 +2472,7 @@ class RetiroPedidoAPITests(APITestCase):
     def test_bar_control_uses_username_when_waiter_has_no_name(self):
         pedido, preparaciones = self.crear_pedido(
             [self.pizza],
-            56,
+            57,
             mozo=self.otro_mozo,
         )
         self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
@@ -2457,7 +2521,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 58")
 
     def test_bar_control_and_confirmation_are_exclusive_to_barra(self):
-        pedido, preparaciones = self.crear_pedido([self.pizza], 59)
+        pedido, preparaciones = self.crear_pedido([self.pizza], 60)
         self.marcar_lista(preparaciones[Sector.Nombre.PIZZA])
 
         for usuario in [self.mozo, self.cocina_pizza, self.admin]:

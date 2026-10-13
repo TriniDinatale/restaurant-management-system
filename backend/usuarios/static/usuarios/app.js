@@ -7,6 +7,9 @@ const API = {
     me: "/api/usuarios/me/",
     mesas: "/api/pedidos/mesas/",
     cuentas: "/api/pedidos/cuentas/",
+    retirosBarra: "/api/pedidos/barra/retiros/",
+    confirmarRetiroBarra: (pedidoId) =>
+        `/api/pedidos/barra/retiros/${pedidoId}/confirmar/`,
     productos: "/api/productos/",
     pedidosPorMesa: "/api/pedidos/mesas/cargas/",
     cargasBarra: "/api/pedidos/barra/cargas/",
@@ -59,6 +62,7 @@ const uncertainCancellationRequests = new Map();
 const uncertainCancellationResolutions = new Set();
 const resolvingCancellationRequests = new Set();
 const cancellationNotificationStates = new Map();
+const confirmingBarRetirements = new Set();
 
 function uncertainOrdersStorageKey(userId) {
     return `restaurant:uncertain-order-mesas:${userId}`;
@@ -1588,6 +1592,119 @@ async function loadTables() {
     }
 }
 
+function setBarRetirementMessage(text, isError = false) {
+    const message = document.getElementById("bar-retirements-message");
+    message.textContent = text;
+    message.classList.toggle("message-error", isError);
+    message.hidden = !text;
+}
+
+function renderBarRetirements(requests) {
+    const container = document.getElementById("bar-retirements-list");
+    container.replaceChildren();
+    if (!requests.length) {
+        container.append(makeElement(
+            "p",
+            "summary-empty",
+            "No hay pedidos pendientes de Cocina.",
+        ));
+        return;
+    }
+
+    const sectorLabels = { PIZZA: "Pizza", PLATOS: "Platos" };
+    for (const request of requests) {
+        const card = makeElement("article", "cancellation-card");
+        const header = makeElement("header", "cancellation-card-header");
+        header.append(makeElement("h3", "", `Pedido #${request.pedido}`));
+        card.append(header);
+        card.append(makeElement("p", "", request.identificacion));
+        card.append(makeElement("p", "", `Mozo: ${request.mozo_nombre}`));
+        card.append(makeElement("h4", "", "Productos de Cocina"));
+        const products = makeElement("ul", "bar-retirement-products");
+        for (const product of request.productos_cocina || []) {
+            products.append(makeElement(
+                "li",
+                "",
+                `${product.producto_nombre} · ${product.cantidad} unidad(es) · ${
+                    sectorLabels[product.sector] || product.sector
+                }`,
+            ));
+        }
+        card.append(products);
+
+        const button = makeElement(
+            "button",
+            "button button-primary",
+            "Confirmar recepción y revisión",
+        );
+        button.type = "button";
+        button.dataset.orderId = String(request.pedido);
+        button.disabled = (
+            !request.puede_habilitar_retiro
+            || confirmingBarRetirements.has(request.pedido)
+        );
+        card.append(button);
+
+        const barraPreparation = (request.estados_sectores || []).find(
+            (preparation) => preparation.sector === "BARRA",
+        );
+        if (barraPreparation && barraPreparation.estado !== "LISTO") {
+            card.append(makeElement(
+                "p",
+                "",
+                "Los productos de Barra deben estar listos antes de avisar al mozo.",
+            ));
+        }
+        container.append(card);
+    }
+}
+
+async function loadBarRetirements(successMessage = "") {
+    const loading = document.getElementById("bar-retirements-loading");
+    loading.hidden = false;
+    setBarRetirementMessage("");
+    document.getElementById("bar-retirements-list").replaceChildren();
+    try {
+        const requests = await fetchApi(API.retirosBarra);
+        renderBarRetirements(requests);
+        loading.hidden = true;
+        if (successMessage) setBarRetirementMessage(successMessage);
+        return true;
+    } catch (error) {
+        loading.hidden = true;
+        setBarRetirementMessage(
+            error.message || "No se pudieron consultar los retiros pendientes.",
+            true,
+        );
+        return false;
+    }
+}
+
+async function confirmBarRetirement(button) {
+    const pedidoId = Number(button.dataset.orderId);
+    if (
+        !Number.isSafeInteger(pedidoId)
+        || pedidoId < 1
+        || button.disabled
+        || confirmingBarRetirements.has(pedidoId)
+    ) return;
+
+    confirmingBarRetirements.add(pedidoId);
+    button.disabled = true;
+    try {
+        await fetchApi(API.confirmarRetiroBarra(pedidoId), { method: "POST" });
+        await loadBarRetirements("Retiro confirmado y mozo notificado.");
+    } catch (error) {
+        await loadBarRetirements();
+        setBarRetirementMessage(
+            error.message || "No se pudo confirmar el retiro.",
+            true,
+        );
+    } finally {
+        confirmingBarRetirements.delete(pedidoId);
+    }
+}
+
 function isCurrentCancellationList(generation) {
     return cancellationsViewGeneration === generation
         && document.body.dataset.page === "cancelaciones";
@@ -2051,9 +2168,25 @@ async function initializeOperationalPage() {
     if (document.body.dataset.page === "mesas") {
         document.getElementById("cancellation-nav").hidden =
             user.rol !== "BARRA";
+        const barRetirements = document.getElementById("bar-retirements");
+        barRetirements.hidden = user.rol !== "BARRA";
+        if (user.rol === "BARRA") {
+            document.getElementById("bar-retirements-refresh").addEventListener(
+                "click",
+                () => loadBarRetirements(),
+            );
+            document.getElementById("bar-retirements-list").addEventListener(
+                "click",
+                (event) => {
+                    const button = event.target.closest("button[data-order-id]");
+                    if (button) confirmBarRetirement(button);
+                },
+            );
+        }
         initializeOrderForm();
         document.getElementById("refresh-button").addEventListener("click", loadTables);
         await loadTables();
+        if (user.rol === "BARRA") await loadBarRetirements();
     }
     if (document.body.dataset.page === "cancelaciones") {
         const tablesNav = document.getElementById("tables-nav");

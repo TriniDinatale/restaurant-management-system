@@ -70,6 +70,11 @@ class WebInterfaceAccessTests(TestCase):
                 self.assertContains(response, 'id="notification-toggle"')
                 self.assertContains(response, "Actualizar datos")
                 if user.rol == User.Rol.BARRA:
+                    self.assertContains(response, 'id="bar-retirements"')
+                    self.assertContains(
+                        response,
+                        "Confirmá que recibiste y revisaste los productos",
+                    )
                     self.assertContains(response, "Solicitudes de cancelación")
                     cancellation_page = self.client.get(
                         reverse("web-cancelaciones")

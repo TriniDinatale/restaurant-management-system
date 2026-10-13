@@ -713,6 +713,7 @@ class ControlRetiroBarraSerializer(serializers.ModelSerializer):
         read_only=True,
     )
     mozo_nombre = serializers.SerializerMethodField()
+    productos_cocina = serializers.SerializerMethodField()
     estados_sectores = serializers.SerializerMethodField()
     retiro_habilitado = serializers.SerializerMethodField()
     puede_habilitar_retiro = serializers.BooleanField(read_only=True)
@@ -726,6 +727,7 @@ class ControlRetiroBarraSerializer(serializers.ModelSerializer):
             "pedido",
             "mozo_id",
             "mozo_nombre",
+            "productos_cocina",
             "estados_sectores",
             "retiro_habilitado",
             "puede_habilitar_retiro",
@@ -734,6 +736,18 @@ class ControlRetiroBarraSerializer(serializers.ModelSerializer):
 
     def get_mozo_nombre(self, pedido):
         return pedido.mozo.get_full_name().strip() or pedido.mozo.username
+
+    def get_productos_cocina(self, pedido):
+        sectores_cocina = {Sector.Nombre.PIZZA, Sector.Nombre.PLATOS}
+        return [
+            {
+                "producto_nombre": detalle.producto.nombre,
+                "cantidad": detalle.cantidad,
+                "sector": detalle.sector_destino.nombre,
+            }
+            for detalle in pedido.detalles.all()
+            if detalle.sector_destino.nombre in sectores_cocina
+        ]
 
     def get_estados_sectores(self, pedido):
         return [
