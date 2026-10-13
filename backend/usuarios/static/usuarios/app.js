@@ -1600,7 +1600,7 @@ function renderCancellationRequests(requests) {
         container.append(makeElement(
             "p",
             "summary-empty",
-            "No hay solicitudes pendientes para tu sector.",
+            "No hay solicitudes pendientes.",
         ));
         return;
     }
@@ -1634,18 +1634,20 @@ function renderCancellationRequests(requests) {
             `${request.cantidad} unidad(es) · Solicita ${request.solicitante_nombre}`,
         ));
         card.append(makeElement("p", "", `Motivo: ${request.motivo}`));
-        const actions = makeElement("div", "cancellation-review-actions");
-        const button = makeElement("button", "button button-primary", "Aceptar");
-        button.type = "button";
-        button.dataset.requestId = String(request.id);
-        button.dataset.accountId = String(request.cuenta_id);
-        button.dataset.state = "ACEPTADA";
-        button.disabled = (
-            uncertainCancellationResolutions.has(request.id)
-            || resolvingCancellationRequests.has(request.id)
-        );
-        actions.append(button);
-        card.append(actions);
+        if (canReviewCancellationRequests()) {
+            const actions = makeElement("div", "cancellation-review-actions");
+            const button = makeElement("button", "button button-primary", "Aceptar");
+            button.type = "button";
+            button.dataset.requestId = String(request.id);
+            button.dataset.accountId = String(request.cuenta_id);
+            button.dataset.state = "ACEPTADA";
+            button.disabled = (
+                uncertainCancellationResolutions.has(request.id)
+                || resolvingCancellationRequests.has(request.id)
+            );
+            actions.append(button);
+            card.append(actions);
+        }
         container.append(card);
     }
 }
@@ -1689,7 +1691,8 @@ async function resolveCancellation(button) {
     const requestId = Number(button.dataset.requestId);
     const state = button.dataset.state;
     if (
-        !Number.isSafeInteger(requestId)
+        !canReviewCancellationRequests()
+        || !Number.isSafeInteger(requestId)
         || requestId < 1
         || state !== "ACEPTADA"
         || button.disabled
@@ -1772,10 +1775,7 @@ async function resolveCancellation(button) {
 function canReviewCancellationRequests() {
     return Boolean(
         currentUser
-        && (
-            currentUser.rol === "BARRA"
-            || currentUser.rol === "COCINA"
-        ),
+        && currentUser.rol === "BARRA",
     );
 }
 
@@ -1904,7 +1904,7 @@ async function refreshCancellationNotifications(
     if (
         document.visibilityState !== "visible"
         || !currentUser
-        || !["MOZO", "BARRA", "COCINA"].includes(currentUser.rol)
+        || !["MOZO", "BARRA"].includes(currentUser.rol)
     ) return false;
     if (notificationRefreshPending) {
         const currentRefresh = notificationRefreshPromise;
@@ -1988,7 +1988,7 @@ async function refreshCancellationNotifications(
 function initializeCancellationNotifications() {
     const bell = document.getElementById("notification-toggle");
     if (!bell) return;
-    if (!["MOZO", "BARRA", "COCINA"].includes(currentUser.rol)) {
+    if (!["MOZO", "BARRA"].includes(currentUser.rol)) {
         bell.closest(".notification-bell").hidden = true;
         return;
     }

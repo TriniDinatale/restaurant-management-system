@@ -57,23 +57,20 @@ class IsCancellationNotificationUser(BasePermission):
         if user.rol == User.Rol.MOZO:
             return True
         return (
-            user.rol in {User.Rol.BARRA, User.Rol.COCINA}
+            user.rol == User.Rol.BARRA
             and user.sector_id is not None
-            and user.sector.nombre
-            in {
-                Sector.Nombre.BARRA,
-                Sector.Nombre.PIZZA,
-                Sector.Nombre.PLATOS,
-            }
-            and (
-                user.rol != User.Rol.BARRA
-                or user.sector.nombre == Sector.Nombre.BARRA
-            )
-            and (
-                user.rol != User.Rol.COCINA
-                or user.sector.nombre
-                in {Sector.Nombre.PIZZA, Sector.Nombre.PLATOS}
-            )
+            and user.sector.nombre == Sector.Nombre.BARRA
+        )
+
+
+class IsCancellationReviewer(BasePermission):
+    def has_permission(self, request, view):
+        user = request.user
+        return (
+            user.is_authenticated
+            and user.rol == User.Rol.BARRA
+            and user.sector_id is not None
+            and user.sector.nombre == Sector.Nombre.BARRA
         )
 
 
@@ -253,14 +250,13 @@ class SolicitudCancelacionCreateView(generics.GenericAPIView):
 
 
 class SolicitudesCancelacionPendientesView(generics.ListAPIView):
-    permission_classes = [IsPreparador]
+    permission_classes = [IsCancellationReviewer]
     serializer_class = SolicitudCancelacionPendienteSerializer
 
     def get_queryset(self):
         return (
             SolicitudCancelacionDetalle.objects.filter(
                 estado=SolicitudCancelacionDetalle.Estado.PENDIENTE,
-                detalle__sector_destino_id=self.request.user.sector_id,
                 detalle__pedido__cuenta__estado=Cuenta.Estado.ABIERTA,
             )
             .select_related(
@@ -288,8 +284,6 @@ class NotificacionesCancelacionListView(generics.ListAPIView):
             queryset = queryset.filter(solicitante=usuario)
         else:
             queryset = queryset.filter(
-                detalle__sector_destino_id=usuario.sector_id,
-            ).filter(
                 ~Q(estado=SolicitudCancelacionDetalle.Estado.PENDIENTE)
                 | Q(
                     estado=SolicitudCancelacionDetalle.Estado.PENDIENTE,
@@ -310,7 +304,7 @@ class NotificacionesCancelacionListView(generics.ListAPIView):
 
 
 class ResolverSolicitudCancelacionView(generics.GenericAPIView):
-    permission_classes = [IsPreparador]
+    permission_classes = [IsCancellationReviewer]
     serializer_class = ResolverCancelacionSerializer
 
     def post(self, request, *args, **kwargs):
@@ -347,7 +341,6 @@ class ResolverSolicitudCancelacionView(generics.GenericAPIView):
                 DetallePedido.objects.select_for_update(of=("self",)),
                 pk=detalle_id,
                 pedido__cuenta=cuenta,
-                sector_destino_id=request.user.sector_id,
             )
             solicitud = get_object_or_404(
                 SolicitudCancelacionDetalle.objects.select_for_update(

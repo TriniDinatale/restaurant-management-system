@@ -5,20 +5,12 @@ from usuarios.models import Sector, User
 
 def _can_review_cancellations(user):
     sector_nombre = user.sector.nombre if user.sector_id else None
-    return (
-        user.rol == User.Rol.BARRA
-        and sector_nombre == Sector.Nombre.BARRA
-    ) or (
-        user.rol == User.Rol.COCINA
-        and sector_nombre in {Sector.Nombre.PIZZA, Sector.Nombre.PLATOS}
-    )
+    return user.rol == User.Rol.BARRA and sector_nombre == Sector.Nombre.BARRA
 
 
 def _role_home(user):
     if user.rol in {User.Rol.MOZO, User.Rol.BARRA}:
         return "web-mesas"
-    if _can_review_cancellations(user) and user.rol == User.Rol.COCINA:
-        return "web-cancelaciones"
     return "web-pendiente"
 
 
@@ -41,8 +33,6 @@ def web_pendiente(request):
         return redirect("web-home")
     if request.user.rol in {User.Rol.MOZO, User.Rol.BARRA}:
         return redirect("web-mesas")
-    if _can_review_cancellations(request.user) and request.user.rol == User.Rol.COCINA:
-        return redirect("web-cancelaciones")
     return render(request, "usuarios/pendiente.html")
 
 

@@ -106,22 +106,20 @@ class WebInterfaceAccessTests(TestCase):
             reverse("web-pendiente"),
         )
 
-    def test_kitchen_uses_sector_cancellation_screen(self):
+    def test_kitchen_cannot_access_cancellation_screen(self):
         self.client.force_login(self.cocina)
         self.assertRedirects(
             self.client.get(reverse("web-home")),
-            reverse("web-cancelaciones"),
+            reverse("web-pendiente"),
         )
-        self.assertRedirects(
-            self.client.get(reverse("web-pendiente")),
-            reverse("web-cancelaciones"),
-        )
-        response = self.client.get(reverse("web-cancelaciones"))
-        self.assertEqual(response.status_code, 200)
-        self.assertTemplateUsed(response, "usuarios/cancelaciones.html")
-        self.assertContains(response, "Solicitudes de cancelación")
-        self.assertContains(response, 'id="notification-toggle"')
+        pending = self.client.get(reverse("web-pendiente"))
+        self.assertEqual(pending.status_code, 200)
+        self.assertTemplateUsed(pending, "usuarios/pendiente.html")
         self.assertRedirects(
             self.client.get(reverse("web-mesas")),
-            reverse("web-cancelaciones"),
+            reverse("web-pendiente"),
+        )
+        self.assertRedirects(
+            self.client.get(reverse("web-cancelaciones")),
+            reverse("web-pendiente"),
         )

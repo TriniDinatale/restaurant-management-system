@@ -3024,7 +3024,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             self.cocina_pizza,
             SolicitudCancelacionDetalle.Estado.ACEPTADA,
         )
-        self.assertEqual(wrong_sector.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(wrong_sector.status_code, status.HTTP_403_FORBIDDEN)
 
         accepted = self.resolver(
             solicitud_id,
@@ -3099,7 +3099,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             solicitud_historica.pk,
         )
 
-    def test_notificaciones_solo_exponen_sector_o_solicitudes_propias(self):
+    def test_barra_recibe_todos_los_sectores_y_mozos_solo_sus_solicitudes(self):
         self.client.force_authenticate(user=self.mozo)
         propia = self.solicitar()
         producto_pizza = Producto.objects.create(
@@ -3189,7 +3189,12 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         self.assertEqual(barra.status_code, status.HTTP_200_OK)
         self.assertEqual(
             {item["id"] for item in barra.data},
-            {propia.data["id"], ajena.data["id"], historica.pk},
+            {
+                propia.data["id"],
+                pizza_request.data["id"],
+                ajena.data["id"],
+                historica.pk,
+            },
         )
         self.assertIn(
             "RECHAZADA",
@@ -3207,15 +3212,9 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             with self.subTest(rol=usuario.rol, sector=usuario.sector.nombre):
                 self.client.force_authenticate(user=usuario)
                 response = self.client.get(self.notificaciones_url)
-                self.assertEqual(response.status_code, status.HTTP_200_OK)
-                expected = (
-                    {pizza_request.data["id"]}
-                    if usuario == self.cocina_pizza
-                    else set()
-                )
                 self.assertEqual(
-                    {item["id"] for item in response.data},
-                    expected,
+                    response.status_code,
+                    status.HTTP_403_FORBIDDEN,
                 )
 
         self.client.force_authenticate(user=self.otro_mozo)
@@ -3282,7 +3281,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         self.assertEqual(response.data[0]["estado"], "RECHAZADA")
         self.assertNotEqual(response.data[0]["id"], solicitud_ajena.pk)
 
-    def test_pendientes_se_filtran_por_sector_destino_guardado(self):
+    def test_barra_ve_y_acepta_pendientes_de_todos_los_sectores(self):
         producto_pizza = Producto.objects.create(
             nombre="Pizza para cancelar",
             precio=Decimal("1800.00"),
@@ -3294,45 +3293,64 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             producto=producto_pizza,
             cantidad=2,
         )
-        producto_pizza.sector_destino = self.platos
-        producto_pizza.save(update_fields=["sector_destino"])
-        self.client.force_authenticate(user=self.mozo)
-        self.assertEqual(self.solicitar().status_code, status.HTTP_201_CREATED)
-        pizza_url = reverse(
-            "detalle-solicitar-cancelacion",
-            args=[self.cuenta.pk, detalle_pizza.pk],
+        producto_platos = Producto.objects.create(
+            nombre="Plato para cancelar",
+            precio=Decimal("2400.00"),
+            categoria=self.categoria,
+            sector_destino=self.platos,
         )
-        self.assertEqual(
-            self.client.post(
-                pizza_url,
+        detalle_platos = DetallePedido.objects.create(
+            pedido=self.pedido,
+            producto=producto_platos,
+            cantidad=2,
+        )
+        self.client.force_authenticate(user=self.mozo)
+        solicitudes = [self.solicitar()]
+        for detalle in [detalle_pizza, detalle_platos]:
+            response = self.client.post(
+                reverse(
+                    "detalle-solicitar-cancelacion",
+                    args=[self.cuenta.pk, detalle.pk],
+                ),
                 {
                     "clave_idempotencia": uuid4(),
                     "cantidad": 1,
                     "motivo": "Pedido equivocado",
                 },
                 format="json",
-            ).status_code,
-            status.HTTP_201_CREATED,
-        )
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            solicitudes.append(response)
+
+        for solicitud in solicitudes:
+            for usuario in [self.cocina_pizza, self.cocina_platos]:
+                with self.subTest(
+                    sector=usuario.sector.nombre,
+                    solicitud=solicitud.data["id"],
+                ):
+                    respuesta = self.resolver(
+                        solicitud.data["id"],
+                        usuario,
+                        SolicitudCancelacionDetalle.Estado.ACEPTADA,
+                    )
+                    self.assertEqual(
+                        respuesta.status_code,
+                        status.HTTP_403_FORBIDDEN,
+                    )
 
         self.client.force_authenticate(user=self.barra_user)
         barra_items = self.client.get(self.pendientes_url)
         self.assertEqual(barra_items.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(barra_items.data), 1)
-        self.assertEqual(barra_items.data[0]["producto_nombre"], "Bebida para cancelar")
+        self.assertEqual(
+            {item["producto_nombre"] for item in barra_items.data},
+            {
+                "Bebida para cancelar",
+                "Pizza para cancelar",
+                "Plato para cancelar",
+            },
+        )
 
-        self.client.force_authenticate(user=self.cocina_pizza)
-        pizza_items = self.client.get(self.pendientes_url)
-        self.assertEqual(pizza_items.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(pizza_items.data), 1)
-        self.assertEqual(pizza_items.data[0]["producto_nombre"], "Pizza para cancelar")
-
-        self.client.force_authenticate(user=self.cocina_platos)
-        platos_items = self.client.get(self.pendientes_url)
-        self.assertEqual(platos_items.status_code, status.HTTP_200_OK)
-        self.assertEqual(platos_items.data, [])
-
-        for usuario in [self.mozo, self.admin]:
+        for usuario in [self.cocina_pizza, self.cocina_platos, self.mozo, self.admin]:
             with self.subTest(rol=usuario.rol):
                 self.client.force_authenticate(user=usuario)
                 response = self.client.get(self.pendientes_url)
@@ -3340,6 +3358,59 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
                     response.status_code,
                     status.HTTP_403_FORBIDDEN,
                 )
+
+        for solicitud in solicitudes:
+            accepted = self.resolver(
+                solicitud.data["id"],
+                self.barra_user,
+                SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            )
+            self.assertEqual(accepted.status_code, status.HTTP_200_OK)
+            self.assertEqual(accepted.data["estado"], "ACEPTADA")
+            self.assertEqual(
+                accepted.data["resuelto_por_id"],
+                self.barra_user.pk,
+            )
+
+    def test_barra_sin_sector_o_con_sector_incorrecto_no_puede_revisar(self):
+        self.client.force_authenticate(user=self.mozo)
+        pending = self.solicitar()
+        self.assertEqual(pending.status_code, status.HTTP_201_CREATED)
+
+        barra_sin_sector = User.objects.create_user(
+            username="cancelacion_barra_sin_sector",
+            rol=User.Rol.BARRA,
+        )
+        barra_otro_sector = User.objects.create_user(
+            username="cancelacion_barra_otro_sector",
+            rol=User.Rol.BARRA,
+            sector=self.pizza,
+        )
+
+        for usuario in [barra_sin_sector, barra_otro_sector]:
+            with self.subTest(usuario=usuario.username):
+                self.client.force_authenticate(user=usuario)
+                pending_list = self.client.get(self.pendientes_url)
+                self.assertEqual(
+                    pending_list.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+                resolution = self.client.post(
+                    reverse("cancelacion-resolver", args=[pending.data["id"]]),
+                    {"estado": SolicitudCancelacionDetalle.Estado.ACEPTADA},
+                    format="json",
+                )
+                self.assertEqual(
+                    resolution.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+        solicitud = SolicitudCancelacionDetalle.objects.get(pk=pending.data["id"])
+        self.assertEqual(
+            solicitud.estado,
+            SolicitudCancelacionDetalle.Estado.PENDIENTE,
+        )
+        self.assertIsNone(solicitud.resuelto_por_id)
 
     def test_cuenta_cerrada_no_admite_solicitud_ni_resolucion_y_nueva_cuenta_aislada(self):
         self.client.force_authenticate(user=self.mozo)
