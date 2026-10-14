@@ -13,6 +13,7 @@ from .models import (
     AvisoCargaBarra,
     Cuenta,
     DetallePedido,
+    LecturaNotificacionCancelacion,
     Mesa,
     Pedido,
     PreparacionPedidoSector,
@@ -2179,6 +2180,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.categoria = Categoria.objects.create(nombre="Productos retiro")
         self.control_url = reverse("barra-retiros-list")
         self.avisos_url = reverse("aviso-retiro-list")
+        self.avisos_leidos_url = reverse("aviso-retiro-marcar-leidos")
 
     def crear_pedido(
         self,
@@ -2513,12 +2515,79 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["pedido"], primer_pedido.pk)
         self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 57")
+        self.assertFalse(response.data[0]["leido"])
 
         self.client.force_authenticate(user=self.otro_mozo)
         response = self.client.get(self.avisos_url)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["pedido"], segundo_pedido.pk)
         self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 58")
+        self.assertFalse(response.data[0]["leido"])
+
+    def test_mozo_can_persistently_mark_only_own_retirement_notices_as_read(self):
+        primer_pedido, _ = self.crear_pedido([self.pizza], 61)
+        segundo_pedido, _ = self.crear_pedido(
+            [self.platos],
+            62,
+            mozo=self.otro_mozo,
+        )
+        self.confirmar_retiro(primer_pedido)
+        self.confirmar_retiro(segundo_pedido)
+
+        self.client.force_authenticate(user=self.mozo)
+        own_notices = self.client.get(self.avisos_url)
+        self.assertEqual(len(own_notices.data), 1)
+        self.assertEqual(own_notices.data[0]["pedido"], primer_pedido.pk)
+        self.assertEqual(own_notices.data[0]["mensaje"], "Salón · Mesa 61")
+        self.assertFalse(own_notices.data[0]["leido"])
+
+        marked = self.client.post(self.avisos_leidos_url, format="json")
+        self.assertEqual(marked.status_code, status.HTTP_200_OK)
+        self.assertEqual(marked.data, {"actualizados": 1})
+        own_notices = self.client.get(self.avisos_url)
+        self.assertEqual(len(own_notices.data), 1)
+        self.assertTrue(own_notices.data[0]["leido"])
+        self.assertIsNotNone(
+            AvisoRetiro.objects.get(pedido=primer_pedido).leido_en,
+        )
+        self.assertIsNone(
+            AvisoRetiro.objects.get(pedido=segundo_pedido).leido_en,
+        )
+
+        second_mark = self.client.post(self.avisos_leidos_url, format="json")
+        self.assertEqual(second_mark.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_mark.data, {"actualizados": 0})
+
+        self.client.force_authenticate(user=self.otro_mozo)
+        other_notices = self.client.get(self.avisos_url)
+        self.assertEqual(len(other_notices.data), 1)
+        self.assertEqual(other_notices.data[0]["pedido"], segundo_pedido.pk)
+        self.assertFalse(other_notices.data[0]["leido"])
+        self.assertEqual(
+            self.client.post(self.avisos_leidos_url, format="json").data,
+            {"actualizados": 1},
+        )
+
+    def test_retirement_notice_routes_are_mozo_only(self):
+        for usuario in [
+            self.usuario_barra,
+            self.cocina_pizza,
+            self.admin,
+            None,
+        ]:
+            with self.subTest(usuario=usuario):
+                self.client.force_authenticate(user=usuario)
+                for response in [
+                    self.client.get(self.avisos_url),
+                    self.client.post(self.avisos_leidos_url, format="json"),
+                ]:
+                    self.assertIn(
+                        response.status_code,
+                        {
+                            status.HTTP_401_UNAUTHORIZED,
+                            status.HTTP_403_FORBIDDEN,
+                        },
+                    )
 
     def test_bar_control_and_confirmation_are_exclusive_to_barra(self):
         pedido, preparaciones = self.crear_pedido([self.pizza], 60)
@@ -2899,6 +2968,9 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         self.consumo_url = reverse("cuenta-consumo", args=[self.cuenta.pk])
         self.pendientes_url = reverse("cancelacion-pendiente-list")
         self.notificaciones_url = reverse("cancelacion-notificacion-list")
+        self.notificaciones_leidas_url = reverse(
+            "cancelacion-notificacion-marcar-leidas",
+        )
 
     def solicitar(
         self,
@@ -3247,6 +3319,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         self.assertTrue(
             all(item["motivo"] for item in propias.data),
         )
+        self.assertTrue(all(not item["leido"] for item in propias.data))
 
         self.client.force_authenticate(user=self.barra_user)
         barra = self.client.get(self.notificaciones_url)
@@ -3271,6 +3344,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         self.assertTrue(
             all(item["zona"] == "Salón" for item in barra.data),
         )
+        self.assertTrue(all(not item["leido"] for item in barra.data))
 
         for usuario in [self.cocina_pizza, self.cocina_platos]:
             with self.subTest(rol=usuario.rol, sector=usuario.sector.nombre):
@@ -3299,6 +3373,205 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             response.status_code,
             {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN},
         )
+
+    def test_mozo_marca_solo_sus_notificaciones_sin_modificar_solicitudes(self):
+        self.client.force_authenticate(user=self.mozo)
+        propia = self.solicitar()
+
+        otra_mesa = Mesa.objects.create(numero=94, zona=Mesa.Zona.SALON)
+        otra_cuenta = Cuenta.objects.create(
+            mesa=otra_mesa,
+            mozo_responsable=self.otro_mozo,
+        )
+        otro_pedido = Pedido.objects.create(
+            mesa=otra_mesa,
+            cuenta=otra_cuenta,
+            mozo=self.otro_mozo,
+            creado_por=self.otro_mozo,
+        )
+        otro_detalle = DetallePedido.objects.create(
+            pedido=otro_pedido,
+            producto=self.producto,
+            cantidad=2,
+        )
+        self.client.force_authenticate(user=self.otro_mozo)
+        ajena = self.client.post(
+            reverse(
+                "detalle-solicitar-cancelacion",
+                args=[otra_cuenta.pk, otro_detalle.pk],
+            ),
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "Solicitud ajena",
+            },
+            format="json",
+        )
+        self.assertEqual(ajena.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.mozo)
+        visible = self.client.get(self.notificaciones_url)
+        self.assertEqual({item["id"] for item in visible.data}, {propia.data["id"]})
+        self.assertFalse(visible.data[0]["leido"])
+        marked = self.client.post(
+            self.notificaciones_leidas_url,
+            format="json",
+        )
+        self.assertEqual(marked.status_code, status.HTTP_200_OK)
+        self.assertEqual(marked.data, {"actualizadas": 1})
+
+        visible = self.client.get(self.notificaciones_url)
+        self.assertEqual(len(visible.data), 1)
+        self.assertTrue(visible.data[0]["leido"])
+        own_read = LecturaNotificacionCancelacion.objects.get(
+            solicitud_id=propia.data["id"],
+            usuario=self.mozo,
+        )
+        self.assertIsNotNone(own_read.leido_en)
+        self.assertFalse(
+            LecturaNotificacionCancelacion.objects.filter(
+                solicitud_id=ajena.data["id"],
+                usuario=self.mozo,
+            ).exists(),
+        )
+        solicitud_propia = SolicitudCancelacionDetalle.objects.get(
+            pk=propia.data["id"],
+        )
+        self.assertEqual(
+            solicitud_propia.estado,
+            SolicitudCancelacionDetalle.Estado.PENDIENTE,
+        )
+
+        self.client.force_authenticate(user=self.otro_mozo)
+        own_for_other = self.client.get(self.notificaciones_url)
+        self.assertEqual(len(own_for_other.data), 1)
+        self.assertEqual(own_for_other.data[0]["id"], ajena.data["id"])
+        self.assertFalse(own_for_other.data[0]["leido"])
+
+        self.client.force_authenticate(user=self.barra_user)
+        barra_view = self.client.get(self.notificaciones_url)
+        own_as_barra = next(
+            item for item in barra_view.data if item["id"] == propia.data["id"]
+        )
+        self.assertFalse(own_as_barra["leido"])
+
+    def test_barra_marca_solo_notificaciones_que_puede_consultar(self):
+        self.client.force_authenticate(user=self.mozo)
+        visible_request = self.solicitar()
+        closed_mesa = Mesa.objects.create(
+            numero=95,
+            zona=Mesa.Zona.SALON,
+        )
+        closed_account = Cuenta.objects.create(
+            mesa=closed_mesa,
+            mozo_responsable=self.otro_mozo,
+        )
+        closed_order = Pedido.objects.create(
+            mesa=closed_mesa,
+            cuenta=closed_account,
+            mozo=self.otro_mozo,
+            creado_por=self.otro_mozo,
+        )
+        closed_detail = DetallePedido.objects.create(
+            pedido=closed_order,
+            producto=self.producto,
+            cantidad=2,
+        )
+        self.client.force_authenticate(user=self.otro_mozo)
+        closed_request = self.client.post(
+            reverse(
+                "detalle-solicitar-cancelacion",
+                args=[closed_account.pk, closed_detail.pk],
+            ),
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "Solicitud de otra cuenta",
+            },
+            format="json",
+        )
+        self.assertEqual(closed_request.status_code, status.HTTP_201_CREATED)
+        closed_account.cerrar()
+
+        self.client.force_authenticate(user=self.barra_user)
+        before = self.client.get(self.notificaciones_url)
+        self.assertEqual(
+            {item["id"] for item in before.data},
+            {visible_request.data["id"]},
+        )
+        marked = self.client.post(
+            self.notificaciones_leidas_url,
+            format="json",
+        )
+        self.assertEqual(marked.status_code, status.HTTP_200_OK)
+        self.assertEqual(marked.data, {"actualizadas": 1})
+
+        after = self.client.get(self.notificaciones_url)
+        self.assertEqual(len(after.data), 1)
+        self.assertTrue(after.data[0]["leido"])
+        self.assertTrue(
+            LecturaNotificacionCancelacion.objects.filter(
+                solicitud_id=visible_request.data["id"],
+                usuario=self.barra_user,
+            ).exists(),
+        )
+        self.assertFalse(
+            LecturaNotificacionCancelacion.objects.filter(
+                solicitud_id=closed_request.data["id"],
+                usuario=self.barra_user,
+            ).exists(),
+        )
+        visible_request_db = SolicitudCancelacionDetalle.objects.get(
+            pk=visible_request.data["id"],
+        )
+        closed_request_db = SolicitudCancelacionDetalle.objects.get(
+            pk=closed_request.data["id"],
+        )
+        self.assertEqual(
+            visible_request_db.estado,
+            SolicitudCancelacionDetalle.Estado.PENDIENTE,
+        )
+        self.assertEqual(
+            closed_request_db.estado,
+            SolicitudCancelacionDetalle.Estado.PENDIENTE,
+        )
+
+    def test_solo_mozo_y_barra_autorizada_pueden_marcar_notificaciones(self):
+        for usuario in [self.cocina_pizza, self.cocina_platos, self.admin, None]:
+            with self.subTest(usuario=usuario):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.post(
+                    self.notificaciones_leidas_url,
+                    format="json",
+                )
+                self.assertIn(
+                    response.status_code,
+                    {
+                        status.HTTP_401_UNAUTHORIZED,
+                        status.HTTP_403_FORBIDDEN,
+                    },
+                )
+
+        barra_sin_sector = User.objects.create_user(
+            username="cancelacion_barra_sin_sector_lectura",
+            rol=User.Rol.BARRA,
+        )
+        barra_sector_incorrecto = User.objects.create_user(
+            username="cancelacion_barra_sector_incorrecto_lectura",
+            rol=User.Rol.BARRA,
+            sector=self.pizza,
+        )
+        for usuario in [barra_sin_sector, barra_sector_incorrecto]:
+            with self.subTest(usuario=usuario.username):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.post(
+                    self.notificaciones_leidas_url,
+                    format="json",
+                )
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
 
     def test_mozo_ve_resultado_historico_solo_de_sus_solicitudes(self):
         historica = SolicitudCancelacionDetalle.objects.create(

@@ -1,7 +1,7 @@
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum, prefetch_related_objects
+from django.db.models import Exists, OuterRef, Q, Sum, prefetch_related_objects
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, serializers, status
@@ -17,6 +17,7 @@ from .models import (
     AvisoRetiro,
     Cuenta,
     DetallePedido,
+    LecturaNotificacionCancelacion,
     Mesa,
     Pedido,
     PreparacionPedidoSector,
@@ -37,6 +38,7 @@ from .serializers import (
     ResolverCancelacionSerializer,
     SolicitudCancelacionCreateSerializer,
     SolicitudCancelacionPendienteSerializer,
+    SolicitudCancelacionNotificacionSerializer,
     SolicitudCancelacionSerializer,
 )
 
@@ -275,22 +277,16 @@ class SolicitudesCancelacionPendientesView(generics.ListAPIView):
 
 class NotificacionesCancelacionListView(generics.ListAPIView):
     permission_classes = [IsCancellationNotificationUser]
-    serializer_class = SolicitudCancelacionPendienteSerializer
+    serializer_class = SolicitudCancelacionNotificacionSerializer
 
     def get_queryset(self):
-        queryset = SolicitudCancelacionDetalle.objects.all()
-        usuario = self.request.user
-        if usuario.rol == User.Rol.MOZO:
-            queryset = queryset.filter(solicitante=usuario)
-        else:
-            queryset = queryset.filter(
-                ~Q(estado=SolicitudCancelacionDetalle.Estado.PENDIENTE)
-                | Q(
-                    estado=SolicitudCancelacionDetalle.Estado.PENDIENTE,
-                    detalle__pedido__cuenta__estado=Cuenta.Estado.ABIERTA,
-                ),
-            )
-        return queryset.select_related(
+        leidas_por_usuario = LecturaNotificacionCancelacion.objects.filter(
+            solicitud_id=OuterRef("pk"),
+            usuario=self.request.user,
+        )
+        return _cancelaciones_visibles(self.request.user).annotate(
+            leido=Exists(leidas_por_usuario),
+        ).select_related(
             "solicitante",
             "resuelto_por",
             "detalle",
@@ -301,6 +297,47 @@ class NotificacionesCancelacionListView(generics.ListAPIView):
         ).prefetch_related(
             "detalle__solicitudes_cancelacion",
         ).order_by("-fecha_solicitud", "-pk")
+
+
+def _cancelaciones_visibles(usuario):
+    queryset = SolicitudCancelacionDetalle.objects.all()
+    if usuario.rol == User.Rol.MOZO:
+        return queryset.filter(solicitante=usuario)
+    return queryset.filter(
+        ~Q(estado=SolicitudCancelacionDetalle.Estado.PENDIENTE)
+        | Q(
+            estado=SolicitudCancelacionDetalle.Estado.PENDIENTE,
+            detalle__pedido__cuenta__estado=Cuenta.Estado.ABIERTA,
+        ),
+    )
+
+
+class MarcarNotificacionesCancelacionLeidasView(generics.GenericAPIView):
+    permission_classes = [IsCancellationNotificationUser]
+
+    def post(self, request, *args, **kwargs):
+        solicitudes = list(
+            _cancelaciones_visibles(request.user).values_list("pk", flat=True),
+        )
+        lecturas_existentes = set(
+            LecturaNotificacionCancelacion.objects.filter(
+                usuario=request.user,
+                solicitud_id__in=solicitudes,
+            ).values_list("solicitud_id", flat=True),
+        )
+        nuevas_lecturas = [
+            LecturaNotificacionCancelacion(
+                solicitud_id=solicitud_id,
+                usuario=request.user,
+            )
+            for solicitud_id in solicitudes
+            if solicitud_id not in lecturas_existentes
+        ]
+        LecturaNotificacionCancelacion.objects.bulk_create(
+            nuevas_lecturas,
+            ignore_conflicts=True,
+        )
+        return Response({"actualizadas": len(nuevas_lecturas)})
 
 
 class ResolverSolicitudCancelacionView(generics.GenericAPIView):
@@ -559,3 +596,14 @@ class AvisosRetiroListView(generics.ListAPIView):
         return AvisoRetiro.objects.filter(
             destinatario=self.request.user,
         ).select_related("pedido")
+
+
+class MarcarAvisosRetiroLeidosView(generics.GenericAPIView):
+    permission_classes = [IsMozo]
+
+    def post(self, request, *args, **kwargs):
+        actualizados = AvisoRetiro.objects.filter(
+            destinatario=request.user,
+            leido_en__isnull=True,
+        ).update(leido_en=timezone.now())
+        return Response({"actualizados": actualizados})

@@ -455,6 +455,17 @@ class SolicitudCancelacionPendienteSerializer(SolicitudCancelacionSerializer):
         )
 
 
+class SolicitudCancelacionNotificacionSerializer(
+    SolicitudCancelacionPendienteSerializer,
+):
+    leido = serializers.BooleanField(read_only=True)
+
+    class Meta(SolicitudCancelacionPendienteSerializer.Meta):
+        fields = SolicitudCancelacionPendienteSerializer.Meta.fields + [
+            "leido",
+        ]
+
+
 class DetalleConsumoSerializer(serializers.ModelSerializer):
     producto_nombre = serializers.CharField(
         source="producto.nombre",
@@ -857,6 +868,7 @@ class AvisoRetiroSerializer(serializers.ModelSerializer):
         source="pedido_id",
         read_only=True,
     )
+    leido = serializers.SerializerMethodField()
 
     class Meta:
         model = AvisoRetiro
@@ -865,8 +877,12 @@ class AvisoRetiroSerializer(serializers.ModelSerializer):
             "pedido",
             "mensaje",
             "fecha_creacion",
+            "leido",
         ]
         read_only_fields = fields
+
+    def get_leido(self, aviso):
+        return aviso.leido_en is not None
 
 
 class TransicionPreparacionSerializer(serializers.Serializer):

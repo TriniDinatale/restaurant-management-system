@@ -380,6 +380,28 @@ class SolicitudCancelacionDetalle(models.Model):
         )
 
 
+class LecturaNotificacionCancelacion(models.Model):
+    solicitud = models.ForeignKey(
+        SolicitudCancelacionDetalle,
+        on_delete=models.CASCADE,
+        related_name="lecturas_notificacion",
+    )
+    usuario = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="lecturas_notificaciones_cancelacion",
+    )
+    leido_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["solicitud", "usuario"],
+                name="unique_lectura_notificacion_cancelacion",
+            ),
+        ]
+
+
 class PreparacionPedidoSector(models.Model):
     class Estado(models.TextChoices):
         PENDIENTE = "PENDIENTE", "Pendiente"
@@ -456,6 +478,11 @@ class AvisoRetiro(models.Model):
     mensaje = models.CharField(max_length=100)
 
     fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    leido_en = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         ordering = ["-fecha_creacion"]

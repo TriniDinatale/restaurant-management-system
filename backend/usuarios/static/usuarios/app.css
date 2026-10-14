@@ -184,6 +184,11 @@ h2 {
     background: var(--canvas);
 }
 
+.notification-item-not-read {
+    border-color: var(--primary);
+    background: var(--surface);
+}
+
 .topbar {
     display: flex;
     min-height: 72px;
@@ -911,6 +916,10 @@ h2 {
     display: grid;
     gap: 14px;
     margin-top: 32px;
+}
+
+#bar-retirements[hidden] {
+    display: none;
 }
 
 .bar-retirements-heading {

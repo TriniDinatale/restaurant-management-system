@@ -18,7 +18,11 @@ const API = {
         `/api/pedidos/cuentas/${cuentaId}/detalles/${detalleId}/cancelaciones/`,
     cancelacionesPendientes: "/api/pedidos/cancelaciones/pendientes/",
     notificacionesCancelacion: "/api/pedidos/cancelaciones/notificaciones/",
+    marcarCancelacionesLeidas:
+        "/api/pedidos/cancelaciones/notificaciones/leidas/",
     resolverCancelacion: (id) => `/api/pedidos/cancelaciones/${id}/resolver/`,
+    avisosRetiro: "/api/pedidos/avisos/",
+    marcarAvisosRetiroLeidos: "/api/pedidos/avisos/leidos/",
 };
 
 const ZONES = [
@@ -1942,7 +1946,7 @@ function notificationStatusText(request) {
         : statusLabel;
 }
 
-function renderCancellationNotifications(requests) {
+function renderCancellationNotifications(requests, retirementNotices = []) {
     const list = document.getElementById("notification-list");
     const count = document.getElementById("notification-count");
     const activeButton = document.activeElement
@@ -1951,25 +1955,56 @@ function renderCancellationNotifications(requests) {
         ? activeButton.dataset.requestId
         : null;
     list.replaceChildren();
-    if (!requests.length) {
+    if (!requests.length && !retirementNotices.length) {
         list.append(makeElement(
             "p",
             "notification-empty",
-            "No hay notificaciones de cancelación.",
+            "No hay notificaciones.",
         ));
     }
 
-    const pendingCount = requests.filter(
-        (request) => request.estado === "PENDIENTE",
-    ).length;
-    const countValue = canReviewCancellationRequests()
-        ? pendingCount
-        : requests.length;
+    const countValue = (
+        retirementNotices.filter((notice) => !notice.leido).length
+        + requests.filter((request) => !request.leido).length
+    );
     count.textContent = String(countValue);
     count.hidden = countValue === 0;
 
-    for (const request of requests) {
-        const item = makeElement("article", "notification-item");
+    const notifications = [
+        ...requests.map((request) => ({
+            tipo: "cancelacion",
+            fecha: request.fecha_solicitud,
+            request,
+        })),
+        ...retirementNotices.map((notice) => ({
+            tipo: "retiro",
+            fecha: notice.fecha_creacion,
+            notice,
+        })),
+    ].sort((left, right) => new Date(right.fecha) - new Date(left.fecha));
+
+    for (const notification of notifications) {
+        if (notification.tipo === "retiro") {
+            const { notice } = notification;
+            const item = makeElement(
+                "article",
+                `notification-item${notice.leido ? "" : " notification-item-not-read"}`,
+            );
+            item.append(makeElement("p", "", notice.mensaje));
+            item.append(makeElement(
+                "span",
+                "notification-status",
+                notice.leido ? "Leída" : "Nueva",
+            ));
+            list.append(item);
+            continue;
+        }
+
+        const { request } = notification;
+        const item = makeElement(
+            "article",
+            `notification-item${request.leido ? "" : " notification-item-not-read"}`,
+        );
         const heading = makeElement("div", "notification-item-heading");
         heading.append(makeElement("strong", "", request.producto_nombre));
         heading.append(makeElement(
@@ -1978,6 +2013,11 @@ function renderCancellationNotifications(requests) {
             notificationStatusText(request),
         ));
         item.append(heading);
+        item.append(makeElement(
+            "span",
+            "notification-status",
+            request.leido ? "Leída" : "Nueva",
+        ));
         item.append(makeElement(
             "p",
             "",
@@ -2035,7 +2075,31 @@ async function refreshCancellationNotifications(
     notificationRefreshPending = true;
     notificationRefreshPromise = (async () => {
         try {
-            const requests = await fetchApi(API.notificacionesCancelacion);
+            let requests = await fetchApi(API.notificacionesCancelacion);
+            let retirementNotices = currentUser.rol === "MOZO"
+                ? await fetchApi(API.avisosRetiro)
+                : [];
+            const panel = document.getElementById("notification-panel");
+            const panelAbierto = panel && !panel.hidden;
+            if (
+                panelAbierto
+                && requests.some((request) => !request.leido)
+            ) {
+                await fetchApi(API.marcarCancelacionesLeidas, {
+                    method: "POST",
+                });
+                requests = await fetchApi(API.notificacionesCancelacion);
+            }
+            if (
+                currentUser.rol === "MOZO"
+                && panelAbierto
+                && retirementNotices.some((notice) => !notice.leido)
+            ) {
+                await fetchApi(API.marcarAvisosRetiroLeidos, {
+                    method: "POST",
+                });
+                retirementNotices = await fetchApi(API.avisosRetiro);
+            }
             const changedAccountIds = new Set();
             for (const request of requests) {
                 const requestId = Number(request.id);
@@ -2071,7 +2135,7 @@ async function refreshCancellationNotifications(
                     unverifiedRequestIds.push(requestId);
                 }
             }
-            renderCancellationNotifications(requests);
+            renderCancellationNotifications(requests, retirementNotices);
             if (unverifiedRequestIds.length) {
                 showNotificationError(
                     "No se pudo verificar el estado de una o más solicitudes; "
@@ -2119,6 +2183,7 @@ function initializeCancellationNotifications() {
         panel.inert = false;
         panel.hidden = false;
         bell.setAttribute("aria-expanded", "true");
+        refreshCancellationNotifications(true);
     });
     document.getElementById("notification-close").addEventListener("click", () => {
         closeNotificationPanel();

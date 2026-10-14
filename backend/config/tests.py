@@ -85,6 +85,11 @@ class WebInterfaceAccessTests(TestCase):
                         "usuarios/cancelaciones.html",
                     )
                 else:
+                    self.assertRegex(
+                        response.content.decode(),
+                        r'<section(?=[^>]*id="bar-retirements")'
+                        r'(?=[^>]*\shidden)[^>]*>',
+                    )
                     self.assertRedirects(
                         self.client.get(reverse("web-cancelaciones")),
                         reverse("web-mesas"),

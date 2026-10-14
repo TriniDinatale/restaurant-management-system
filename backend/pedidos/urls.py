@@ -12,9 +12,11 @@ from .views import (
     MesaListView,
     BarraPedidoCreateView,
     AvisosCargaBarraListView,
+    MarcarAvisosRetiroLeidosView,
     RegistroCargaBarraListView,
     PreparacionPedidoSectorEstadoView,
     PreparacionPedidoSectorListView,
+    MarcarNotificacionesCancelacionLeidasView,
     ResolverSolicitudCancelacionView,
     NotificacionesCancelacionListView,
     SolicitudCancelacionCreateView,
@@ -75,6 +77,11 @@ urlpatterns = [
         name="cancelacion-notificacion-list",
     ),
     path(
+        "cancelaciones/notificaciones/leidas/",
+        MarcarNotificacionesCancelacionLeidasView.as_view(),
+        name="cancelacion-notificacion-marcar-leidas",
+    ),
+    path(
         "cancelaciones/<int:pk>/resolver/",
         ResolverSolicitudCancelacionView.as_view(),
         name="cancelacion-resolver",
@@ -98,6 +105,11 @@ urlpatterns = [
         "barra/retiros/<int:pk>/confirmar/",
         ConfirmarRetiroView.as_view(),
         name="barra-retiro-confirmar",
+    ),
+    path(
+        "avisos/leidos/",
+        MarcarAvisosRetiroLeidosView.as_view(),
+        name="aviso-retiro-marcar-leidos",
     ),
     path(
         "avisos/",
