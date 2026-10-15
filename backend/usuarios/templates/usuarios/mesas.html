@@ -16,23 +16,29 @@
     </div>
 </header>
 <main class="page-shell">
-    <section class="page-heading">
-        <div>
-            <p class="eyebrow">OPERACIÓN</p>
-            <h1>Mesas</h1>
-            <p class="intro">Seleccioná una mesa para consultar su cuenta.</p>
-        </div>
-        <button id="refresh-button" class="button button-secondary" type="button">
-            Actualizar datos
-        </button>
-        <a id="cancellation-nav" class="button button-secondary"
-           href="/cancelaciones/" hidden>
-            Solicitudes de cancelación
-        </a>
-    </section>
+
     <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
     <p id="loading-message" class="loading-message" role="status">Cargando mesas y cuentas…</p>
-    <div id="zones" class="zones" aria-live="polite"></div>
+
+    <section
+        id="bar-preparations"
+        class="bar-retirements"
+        aria-labelledby="bar-preparations-title"
+        hidden
+    >
+        <div class="bar-retirements-heading">
+            <div>
+                <p class="eyebrow">PREPARACIÓN</p>
+                <h2 id="bar-preparations-title">Preparación de Barra</h2>
+                <p class="intro">Prepará los productos de Barra para habilitar su retiro.</p>
+            </div>
+        </div>
+        <p id="bar-preparations-message" class="message" role="status" aria-live="polite" hidden></p>
+        <p id="bar-preparations-loading" class="loading-message" role="status" hidden>
+            Cargando preparaciones…
+        </p>
+        <div id="bar-preparations-list" class="bar-retirement-list" aria-live="polite"></div>
+    </section>
     <section
         id="bar-retirements"
         class="bar-retirements"
@@ -47,13 +53,6 @@
                     Confirmá que recibiste y revisaste los productos antes de avisar al mozo.
                 </p>
             </div>
-            <button
-                id="bar-retirements-refresh"
-                class="button button-secondary"
-                type="button"
-            >
-                Actualizar retiros
-            </button>
         </div>
         <p id="bar-retirements-message" class="message" role="status" aria-live="polite" hidden></p>
         <p id="bar-retirements-loading" class="loading-message" role="status" hidden>
@@ -61,6 +60,15 @@
         </p>
         <div id="bar-retirements-list" class="bar-retirement-list" aria-live="polite"></div>
     </section>
+
+    <section class="page-heading">
+        <div>
+            <h1>Mesas</h1>
+            <p class="intro">Seleccioná una mesa para consultar su cuenta.</p>
+        </div>
+    </section>
+
+    <div id="zones" class="zones" aria-live="polite"></div>
 </main>
 <div id="account-overlay" class="account-overlay" hidden>
     <section
@@ -172,8 +180,6 @@
             <label for="cancellation-quantity">Unidades a cancelar</label>
             <input id="cancellation-quantity" name="cantidad" type="number"
                    min="1" step="1" required>
-            <label for="cancellation-reason">Motivo</label>
-            <textarea id="cancellation-reason" name="motivo" rows="4" required></textarea>
             <div class="order-actions">
                 <button id="cancellation-cancel" class="button button-quiet" type="button">
                     Volver

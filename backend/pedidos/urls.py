@@ -12,6 +12,7 @@ from .views import (
     MesaListView,
     BarraPedidoCreateView,
     AvisosCargaBarraListView,
+    MarcarAvisoRetiroLeidoView,
     MarcarAvisosRetiroLeidosView,
     RegistroCargaBarraListView,
     PreparacionPedidoSectorEstadoView,
@@ -109,7 +110,12 @@ urlpatterns = [
     path(
         "avisos/leidos/",
         MarcarAvisosRetiroLeidosView.as_view(),
-        name="aviso-retiro-marcar-leidos",
+        name="aviso-retiro-marcar-leidas",
+    ),
+    path(
+        "avisos/<int:pk>/leido/",
+        MarcarAvisoRetiroLeidoView.as_view(),
+        name="aviso-retiro-marcar-leido",
     ),
     path(
         "avisos/",

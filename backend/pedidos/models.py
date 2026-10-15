@@ -129,20 +129,6 @@ class Pedido(models.Model):
         related_name="pedidos",
     )
 
-    retiro_habilitado_en = models.DateTimeField(
-        null=True,
-        blank=True,
-    )
-
-    retiro_habilitado_por = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="retiros_habilitados",
-    )
-
-
     class Meta:
         ordering = ["-fecha_creacion"]
 
@@ -186,63 +172,39 @@ class Pedido(models.Model):
             estado=PreparacionPedidoSector.Estado.LISTO,
         ).exists()
 
-    def preparaciones_listas_para_retiro(self):
-        if not self.detalles.exists():
-            return False
-
-        incluye_barra = self.detalles.filter(
-            sector_destino__nombre=Sector.Nombre.BARRA,
-        ).exists()
-        if not incluye_barra:
-            return True
-
-        preparaciones_barra = self.preparaciones_sectoriales.filter(
-            sector__nombre=Sector.Nombre.BARRA,
-        )
-        return (
-            preparaciones_barra.exists()
-            and not preparaciones_barra.exclude(
-                estado=PreparacionPedidoSector.Estado.LISTO,
-            ).exists()
-        )
-
-    @property
-    def puede_habilitar_retiro(self):
-        return (
-            self.retiro_habilitado_en is None
-            and self.preparaciones_listas_para_retiro()
-        )
-
     @transaction.atomic
-    def habilitar_retiro(self, usuario):
-        pedido = Pedido.objects.select_for_update().select_related(
+    def crear_aviso_retiro(self, origen, usuario):
+        Cuenta.objects.select_for_update(of=("self",)).get(
+            pk=self.cuenta_id,
+        )
+        pedido = Pedido.objects.select_for_update(of=("self",)).select_related(
             "mesa",
             "mozo",
         ).get(pk=self.pk)
+        from .services import detalles_vigentes_de_origen
 
-        if pedido.retiro_habilitado_en is not None:
-            self.retiro_habilitado_en = pedido.retiro_habilitado_en
-            self.retiro_habilitado_por = pedido.retiro_habilitado_por
-            return pedido.avisos_retiro.get()
+        if origen == AvisoRetiro.Origen.BARRA:
+            descripcion = "Barra lista"
+        elif origen == AvisoRetiro.Origen.COCINA:
+            descripcion = "Cocina lista"
+        else:
+            raise ValidationError({"origen": "El origen del aviso no es válido."})
 
-        if not pedido.preparaciones_listas_para_retiro():
+        detalles = detalles_vigentes_de_origen(pedido, origen, lock=True)
+        if not detalles:
             raise ValidationError(
-                "Los productos de Barra deben estar listos para habilitar el retiro."
+                "El pedido no contiene productos vigentes del origen indicado."
             )
 
-        fecha_habilitacion = timezone.now()
-        Pedido.objects.filter(pk=pedido.pk).update(
-            retiro_habilitado_en=fecha_habilitacion,
-            retiro_habilitado_por=usuario,
-        )
-        aviso = AvisoRetiro.objects.create(
+        aviso, _ = AvisoRetiro.objects.get_or_create(
             pedido=pedido,
-            destinatario=pedido.mozo,
-            mensaje=pedido.mesa.identificacion,
+            origen=origen,
+            defaults={
+                "destinatario": pedido.mozo,
+                "generado_por": usuario,
+                "mensaje": f"{pedido.mesa.identificacion} — {descripcion}",
+            },
         )
-
-        self.retiro_habilitado_en = fecha_habilitacion
-        self.retiro_habilitado_por = usuario
         return aviso
 
 
@@ -445,6 +407,21 @@ class PreparacionPedidoSector(models.Model):
             self.Estado.EN_PREPARACION: self.Estado.LISTO,
         }
 
+        if (
+            self.estado == self.Estado.LISTO
+            and nuevo_estado == self.Estado.LISTO
+        ):
+            return
+
+        if (
+            self.sector.nombre == Sector.Nombre.BARRA
+            and self.estado == self.Estado.PENDIENTE
+            and nuevo_estado == self.Estado.LISTO
+        ):
+            self.estado = nuevo_estado
+            self.save(update_fields=["estado"])
+            return
+
         if transiciones.get(self.estado) != nuevo_estado:
             raise ValidationError(
                 {
@@ -463,16 +440,35 @@ class PreparacionPedidoSector(models.Model):
 
 
 class AvisoRetiro(models.Model):
+    class Origen(models.TextChoices):
+        BARRA = "BARRA", "Barra"
+        COCINA = "COCINA", "Cocina"
+
     pedido = models.ForeignKey(
         Pedido,
         on_delete=models.CASCADE,
         related_name="avisos_retiro",
     )
 
+    origen = models.CharField(
+        max_length=10,
+        choices=Origen.choices,
+        null=True,
+        blank=True,
+    )
+
     destinatario = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="avisos_retiro",
+    )
+
+    generado_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="avisos_retiro_generados",
     )
 
     mensaje = models.CharField(max_length=100)
@@ -488,7 +484,12 @@ class AvisoRetiro(models.Model):
         ordering = ["-fecha_creacion"]
         constraints = [
             models.UniqueConstraint(
+                fields=["pedido", "origen"],
+                name="unique_aviso_retiro_por_pedido_origen",
+            ),
+            models.UniqueConstraint(
                 fields=["pedido"],
-                name="unique_aviso_retiro_por_pedido",
+                condition=models.Q(origen__isnull=True),
+                name="unique_aviso_retiro_ambiguo_por_pedido",
             ),
         ]

@@ -17,6 +17,11 @@ from .models import (
     PreparacionPedidoSector,
     SolicitudCancelacionDetalle,
 )
+from .services import (
+    cantidad_vigente,
+    cantidades_cancelacion,
+    resumen_detalle_consumo,
+)
 
 
 class DetallePedidoSerializer(serializers.ModelSerializer):
@@ -152,16 +157,12 @@ class PedidoSerializer(serializers.ModelSerializer):
             "mozo",
             "fecha_creacion",
             "detalles",
-            "retiro_habilitado_en",
-            "retiro_habilitado_por",
         ]
 
         read_only_fields = [
             "id",
             "mozo",
             "fecha_creacion",
-            "retiro_habilitado_en",
-            "retiro_habilitado_por",
         ]
 
     def validate_detalles(self, value):
@@ -391,9 +392,10 @@ class SolicitudCancelacionCreateSerializer(serializers.Serializer):
     clave_idempotencia = serializers.UUIDField()
     cantidad = serializers.IntegerField(min_value=1)
     motivo = serializers.CharField(
-        required=True,
-        allow_blank=False,
+        required=False,
+        allow_blank=True,
         trim_whitespace=True,
+        default="",
     )
 
 
@@ -441,18 +443,10 @@ class SolicitudCancelacionPendienteSerializer(SolicitudCancelacionSerializer):
         return solicitud.detalle.pedido.mesa.get_zona_display()
 
     def get_cantidad_cancelada(self, solicitud):
-        detalle = solicitud.detalle
-        return sum(
-            otra.cantidad
-            for otra in detalle.solicitudes_cancelacion.all()
-            if otra.estado == SolicitudCancelacionDetalle.Estado.ACEPTADA
-        )
+        return cantidades_cancelacion(solicitud.detalle)["canceladas"]
 
     def get_cantidad_vigente(self, solicitud):
-        return (
-            solicitud.detalle.cantidad
-            - self.get_cantidad_cancelada(solicitud)
-        )
+        return cantidad_vigente(solicitud.detalle)
 
 
 class SolicitudCancelacionNotificacionSerializer(
@@ -475,6 +469,8 @@ class DetalleConsumoSerializer(serializers.ModelSerializer):
     cantidad_vigente = serializers.SerializerMethodField()
     cantidad_pendiente = serializers.SerializerMethodField()
     cantidad_disponible_cancelacion = serializers.SerializerMethodField()
+    estado_entrega = serializers.SerializerMethodField()
+    puede_solicitar_cancelacion = serializers.SerializerMethodField()
     subtotal_original = serializers.SerializerMethodField()
     subtotal = serializers.SerializerMethodField()
     solicitudes_cancelacion = SolicitudCancelacionSerializer(
@@ -493,6 +489,8 @@ class DetalleConsumoSerializer(serializers.ModelSerializer):
             "cantidad_vigente",
             "cantidad_pendiente",
             "cantidad_disponible_cancelacion",
+            "estado_entrega",
+            "puede_solicitar_cancelacion",
             "precio_unitario",
             "subtotal_original",
             "subtotal",
@@ -501,34 +499,32 @@ class DetalleConsumoSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_cantidad_cancelada(self, detalle):
-        return sum(
-            solicitud.cantidad
-            for solicitud in detalle.solicitudes_cancelacion.all()
-            if solicitud.estado == SolicitudCancelacionDetalle.Estado.ACEPTADA
-        )
+        return cantidades_cancelacion(detalle)["canceladas"]
 
     def get_cantidad_pendiente(self, detalle):
-        return sum(
-            solicitud.cantidad
-            for solicitud in detalle.solicitudes_cancelacion.all()
-            if solicitud.estado == SolicitudCancelacionDetalle.Estado.PENDIENTE
-        )
+        return cantidades_cancelacion(detalle)["pendientes"]
 
     def get_cantidad_vigente(self, detalle):
-        return detalle.cantidad - self.get_cantidad_cancelada(detalle)
+        return cantidad_vigente(detalle)
 
     def get_cantidad_disponible_cancelacion(self, detalle):
-        return (
-            detalle.cantidad
-            - self.get_cantidad_cancelada(detalle)
-            - self.get_cantidad_pendiente(detalle)
-        )
+        return resumen_detalle_consumo(detalle)[
+            "cantidad_disponible_cancelacion"
+        ]
+
+    def get_estado_entrega(self, detalle):
+        return resumen_detalle_consumo(detalle)["estado_entrega"]
+
+    def get_puede_solicitar_cancelacion(self, detalle):
+        return resumen_detalle_consumo(detalle)[
+            "puede_solicitar_cancelacion"
+        ]
 
     def get_subtotal_original(self, detalle):
         return detalle.subtotal
 
     def get_subtotal(self, detalle):
-        return detalle.precio_unitario * self.get_cantidad_vigente(detalle)
+        return detalle.precio_unitario * cantidad_vigente(detalle)
 
 
 class PedidoConsumoSerializer(serializers.ModelSerializer):
@@ -631,6 +627,11 @@ class DetallePreparacionProductoSerializer(serializers.ModelSerializer):
         source="producto.nombre",
         read_only=True,
     )
+    cantidad_original = serializers.IntegerField(
+        source="cantidad",
+        read_only=True,
+    )
+    cantidad = serializers.SerializerMethodField()
 
     class Meta:
         model = DetallePedido
@@ -639,14 +640,30 @@ class DetallePreparacionProductoSerializer(serializers.ModelSerializer):
             "producto",
             "producto_nombre",
             "cantidad",
+            "cantidad_original",
             "precio_unitario",
         ]
         read_only_fields = fields
+
+    def get_cantidad(self, detalle):
+        return cantidad_vigente(detalle)
 
 
 class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
     pedido = serializers.IntegerField(
         source="pedido_id",
+        read_only=True,
+    )
+    mesa = serializers.IntegerField(
+        source="pedido.mesa.numero",
+        read_only=True,
+    )
+    zona = serializers.CharField(
+        source="pedido.mesa.zona",
+        read_only=True,
+    )
+    identificacion = serializers.CharField(
+        source="pedido.mesa.identificacion",
         read_only=True,
     )
     sector = serializers.CharField(
@@ -661,6 +678,9 @@ class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "pedido",
+            "mesa",
+            "zona",
+            "identificacion",
             "sector",
             "estado",
             "fecha_creacion",
@@ -670,9 +690,14 @@ class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_detalles(self, preparacion):
-        detalles = preparacion.pedido.detalles.filter(
-            sector_destino_id=preparacion.sector_id,
-        ).select_related("producto")
+        detalles = [
+            detalle
+            for detalle in preparacion.pedido.detalles.all()
+            if (
+                detalle.sector_destino_id == preparacion.sector_id
+                and cantidad_vigente(detalle) > 0
+            )
+        ]
         return DetallePreparacionProductoSerializer(
             detalles,
             many=True,
@@ -688,11 +713,15 @@ class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
         ):
             return []
 
-        preparaciones = preparacion.pedido.preparaciones_sectoriales.filter(
-            sector__nombre__in={Sector.Nombre.PIZZA, Sector.Nombre.PLATOS},
-        ).exclude(
-            pk=preparacion.pk,
-        ).select_related("sector")
+        preparaciones = [
+            otra
+            for otra in preparacion.pedido.preparaciones_sectoriales.all()
+            if (
+                otra.pk != preparacion.pk
+                and otra.sector.nombre
+                in {Sector.Nombre.PIZZA, Sector.Nombre.PLATOS}
+            )
+        ]
 
         return [
             {
@@ -700,6 +729,11 @@ class PreparacionPedidoSectorSerializer(serializers.ModelSerializer):
                 "estado": otra.estado,
             }
             for otra in preparaciones
+            if any(
+                detalle.sector_destino_id == otra.sector_id
+                and cantidad_vigente(detalle) > 0
+                for detalle in preparacion.pedido.detalles.all()
+            )
         ]
 
 
@@ -725,9 +759,6 @@ class ControlRetiroBarraSerializer(serializers.ModelSerializer):
     )
     mozo_nombre = serializers.SerializerMethodField()
     productos_cocina = serializers.SerializerMethodField()
-    estados_sectores = serializers.SerializerMethodField()
-    retiro_habilitado = serializers.SerializerMethodField()
-    puede_habilitar_retiro = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Pedido
@@ -739,9 +770,6 @@ class ControlRetiroBarraSerializer(serializers.ModelSerializer):
             "mozo_id",
             "mozo_nombre",
             "productos_cocina",
-            "estados_sectores",
-            "retiro_habilitado",
-            "puede_habilitar_retiro",
         ]
         read_only_fields = fields
 
@@ -753,27 +781,15 @@ class ControlRetiroBarraSerializer(serializers.ModelSerializer):
         return [
             {
                 "producto_nombre": detalle.producto.nombre,
-                "cantidad": detalle.cantidad,
+                "cantidad": cantidad_vigente(detalle),
                 "sector": detalle.sector_destino.nombre,
             }
             for detalle in pedido.detalles.all()
-            if detalle.sector_destino.nombre in sectores_cocina
-        ]
-
-    def get_estados_sectores(self, pedido):
-        return [
-            {
-                "sector": preparacion.sector.nombre,
-                "estado": preparacion.estado,
-            }
-            for preparacion in pedido.preparaciones_sectoriales.select_related(
-                "sector",
+            if (
+                detalle.sector_destino.nombre in sectores_cocina
+                and cantidad_vigente(detalle) > 0
             )
         ]
-
-    def get_retiro_habilitado(self, pedido):
-        return pedido.retiro_habilitado_en is not None
-
 
 class DetalleCargaBarraSerializer(serializers.ModelSerializer):
     producto_nombre = serializers.CharField(
@@ -869,12 +885,14 @@ class AvisoRetiroSerializer(serializers.ModelSerializer):
         read_only=True,
     )
     leido = serializers.SerializerMethodField()
+    origen = serializers.CharField(read_only=True, allow_null=True)
 
     class Meta:
         model = AvisoRetiro
         fields = [
             "id",
             "pedido",
+            "origen",
             "mensaje",
             "fecha_creacion",
             "leido",

@@ -309,11 +309,6 @@ h2 {
     font-size: 1.05rem;
 }
 
-.notification-close {
-    min-height: 38px;
-    padding: 5px 9px;
-}
-
 .notification-error {
     margin: 0;
     color: var(--error-border);
@@ -803,6 +798,25 @@ h2 {
     font-size: 0.9rem;
 }
 
+.consumption-delivery-status {
+    width: fit-content;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--canvas);
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+.consumption-delivery-entregado {
+    background: var(--accent);
+    color: var(--primary-dark);
+}
+
+.consumption-delivery-cancelado {
+    background: var(--line);
+}
+
 .consumption-subtotal {
     text-align: right;
 }
@@ -938,6 +952,10 @@ h2 {
 .bar-retirement-list {
     display: grid;
     gap: 14px;
+}
+
+.bar-preparation-status {
+    width: fit-content;
 }
 
 .bar-retirement-products {
@@ -1147,4 +1165,9 @@ h2 {
         scroll-behavior: auto !important;
         transition-duration: 0.01ms !important;
     }
+}
+
+#bar-preparations[hidden],
+#bar-retirements[hidden] {
+    display: none !important;
 }

@@ -1,9 +1,15 @@
 
 from decimal import Decimal
+from datetime import timedelta
 from types import SimpleNamespace
+from threading import Event, Thread
+import time
 
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.db import close_old_connections, connection, transaction
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
+from django.utils import timezone
 
 from productos.models import Categoria, Producto
 from usuarios.models import Sector, User
@@ -22,10 +28,10 @@ from .models import (
 
 from django.urls import reverse
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from unittest.mock import patch
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError
 from uuid import uuid4
 
 class PedidoModelTests(TestCase):
@@ -1807,6 +1813,22 @@ class PreparacionPedidoSectorAPITests(APITestCase):
             len(visible[Sector.Nombre.BARRA]["detalles"]),
             2,
         )
+        self.assertEqual(visible[Sector.Nombre.BARRA]["mesa"], self.mesa.numero)
+        self.assertEqual(visible[Sector.Nombre.BARRA]["zona"], self.mesa.zona)
+        self.assertEqual(
+            visible[Sector.Nombre.BARRA]["identificacion"],
+            self.mesa.identificacion,
+        )
+        self.assertEqual(
+            [
+                (detalle["producto_nombre"], detalle["cantidad"])
+                for detalle in visible[Sector.Nombre.BARRA]["detalles"]
+            ],
+            [
+                (detalle.producto.nombre, detalle.cantidad)
+                for detalle in self.detalles[Sector.Nombre.BARRA]
+            ],
+        )
         self.assertEqual(visible[Sector.Nombre.BARRA]["coordinacion_cocina"], [])
 
     def test_pizza_kitchen_sees_only_pizza_products_and_platos_status(self):
@@ -1876,18 +1898,6 @@ class PreparacionPedidoSectorAPITests(APITestCase):
 
         response = self.client.patch(
             self.estado_url(preparacion),
-            {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(
-            response.data["estado"],
-            PreparacionPedidoSector.Estado.EN_PREPARACION,
-        )
-
-        response = self.client.patch(
-            self.estado_url(preparacion),
             {"estado": PreparacionPedidoSector.Estado.LISTO},
             format="json",
         )
@@ -1896,6 +1906,66 @@ class PreparacionPedidoSectorAPITests(APITestCase):
         self.assertEqual(
             response.data["estado"],
             PreparacionPedidoSector.Estado.LISTO,
+        )
+        self.assertEqual(
+            AvisoRetiro.objects.filter(
+                pedido=self.pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+            ).count(),
+            1,
+        )
+        repeated = self.client.patch(
+            self.estado_url(preparacion),
+            {"estado": PreparacionPedidoSector.Estado.LISTO},
+            format="json",
+        )
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            AvisoRetiro.objects.filter(
+                pedido=self.pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+            ).count(),
+            1,
+        )
+
+    def test_barra_can_finish_legacy_in_preparation_state(self):
+        preparacion = self.preparaciones[Sector.Nombre.BARRA]
+        self.client.force_authenticate(user=self.usuario_barra)
+        started = self.client.patch(
+            self.estado_url(preparacion),
+            {"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
+            format="json",
+        )
+        self.assertEqual(started.status_code, status.HTTP_200_OK)
+        ready = self.client.patch(
+            self.estado_url(preparacion),
+            {"estado": PreparacionPedidoSector.Estado.LISTO},
+            format="json",
+        )
+        self.assertEqual(ready.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            AvisoRetiro.objects.filter(
+                pedido=self.pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+            ).count(),
+            1,
+        )
+
+    def test_cocina_cannot_skip_directly_to_listo(self):
+        preparacion = self.preparaciones[Sector.Nombre.PIZZA]
+        self.client.force_authenticate(user=self.cocina_pizza)
+
+        response = self.client.patch(
+            self.estado_url(preparacion),
+            {"estado": PreparacionPedidoSector.Estado.LISTO},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        preparacion.refresh_from_db()
+        self.assertEqual(
+            preparacion.estado,
+            PreparacionPedidoSector.Estado.PENDIENTE,
         )
 
     def test_kitchen_can_advance_only_its_sector_preparation(self):
@@ -1991,13 +2061,11 @@ class PreparacionPedidoSectorAPITests(APITestCase):
 
     def test_invalid_transitions_do_not_change_persisted_state(self):
         invalid_transitions = [
-            (PreparacionPedidoSector.Estado.PENDIENTE, PreparacionPedidoSector.Estado.LISTO),
             (PreparacionPedidoSector.Estado.PENDIENTE, PreparacionPedidoSector.Estado.PENDIENTE),
             (PreparacionPedidoSector.Estado.EN_PREPARACION, PreparacionPedidoSector.Estado.PENDIENTE),
             (PreparacionPedidoSector.Estado.EN_PREPARACION, PreparacionPedidoSector.Estado.EN_PREPARACION),
             (PreparacionPedidoSector.Estado.LISTO, PreparacionPedidoSector.Estado.EN_PREPARACION),
             (PreparacionPedidoSector.Estado.LISTO, PreparacionPedidoSector.Estado.PENDIENTE),
-            (PreparacionPedidoSector.Estado.LISTO, PreparacionPedidoSector.Estado.LISTO),
         ]
         self.client.force_authenticate(user=self.usuario_barra)
         preparacion = self.preparaciones[Sector.Nombre.BARRA]
@@ -2127,6 +2195,141 @@ class PreparacionPedidoSectorAPITests(APITestCase):
         self.assertEqual(platos.estado, PreparacionPedidoSector.Estado.LISTO)
         self.assertTrue(self.pedido.cocina_lista)
 
+    def test_preparation_uses_only_accepted_cancellations_and_keeps_original_quantity(self):
+        detalle = self.detalles[Sector.Nombre.BARRA][0]
+        detalle.cantidad = 6
+        detalle.save(update_fields=["cantidad"])
+        for estado, cantidad in [
+            (SolicitudCancelacionDetalle.Estado.ACEPTADA, 2),
+            (SolicitudCancelacionDetalle.Estado.PENDIENTE, 1),
+            (SolicitudCancelacionDetalle.Estado.RECHAZADA, 1),
+        ]:
+            SolicitudCancelacionDetalle.objects.create(
+                detalle=detalle,
+                solicitante=self.mozo,
+                clave_idempotencia=uuid4(),
+                cantidad=cantidad,
+                motivo=f"Cancelación {estado.lower()}",
+                estado=estado,
+                resuelto_por=(
+                    self.usuario_barra
+                    if estado != SolicitudCancelacionDetalle.Estado.PENDIENTE
+                    else None
+                ),
+            )
+        self.client.force_authenticate(user=self.usuario_barra)
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        barra = self.preparaciones_visibles(response)[Sector.Nombre.BARRA]
+        product = next(
+            item for item in barra["detalles"] if item["id"] == detalle.pk
+        )
+        self.assertEqual(product["cantidad"], 4)
+        self.assertEqual(product["cantidad_original"], 6)
+
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Otra cancelación aceptada",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.usuario_barra,
+        )
+        updated = self.client.get(self.list_url)
+        product = next(
+            item
+            for item in self.preparaciones_visibles(updated)[
+                Sector.Nombre.BARRA
+            ]["detalles"]
+            if item["id"] == detalle.pk
+        )
+        self.assertEqual(product["cantidad"], 3)
+
+    def test_cancelar_todo_un_origen_oculta_tarea_y_no_genera_aviso_vacio(self):
+        detalles_barra = self.detalles[Sector.Nombre.BARRA]
+        for detalle in detalles_barra:
+            SolicitudCancelacionDetalle.objects.create(
+                detalle=detalle,
+                solicitante=self.mozo,
+                clave_idempotencia=uuid4(),
+                cantidad=detalle.cantidad,
+                motivo="Cancelación total",
+                estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+                resuelto_por=self.usuario_barra,
+            )
+
+        self.client.force_authenticate(user=self.usuario_barra)
+        barra_response = self.client.get(self.list_url)
+        self.assertEqual(barra_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(barra_response.data, [])
+        stale_transition = self.client.patch(
+            self.estado_url(self.preparaciones[Sector.Nombre.BARRA]),
+            {"estado": PreparacionPedidoSector.Estado.LISTO},
+            format="json",
+        )
+        self.assertEqual(stale_transition.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(
+            AvisoRetiro.objects.filter(
+                pedido=self.pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+            ).exists(),
+        )
+
+        self.client.force_authenticate(user=self.cocina_pizza)
+        pizza_response = self.client.get(self.list_url)
+        self.assertEqual(
+            set(self.preparaciones_visibles(pizza_response)),
+            {Sector.Nombre.PIZZA},
+        )
+
+    def test_preparaciones_se_ordenan_por_fecha_y_id_sin_depender_del_estado(self):
+        pedidos = [self.pedido]
+        for numero in [31, 32]:
+            mesa = Mesa.objects.create(numero=numero)
+            cuenta = Cuenta.objects.create(mesa=mesa)
+            pedido = Pedido.objects.create(
+                mesa=mesa,
+                cuenta=cuenta,
+                mozo=self.mozo,
+            )
+            producto = Producto.objects.create(
+                nombre=f"Barra orden {numero}",
+                precio=Decimal("100.00"),
+                categoria=self.categoria,
+                sector_destino=self.barra,
+            )
+            DetallePedido.objects.create(
+                pedido=pedido,
+                producto=producto,
+                cantidad=1,
+            )
+            PreparacionPedidoSector.objects.create(
+                pedido=pedido,
+                sector=self.barra,
+            )
+            pedidos.append(pedido)
+
+        base = timezone.now()
+        for pedido, seconds in zip(pedidos, [20, 0, 10]):
+            Pedido.objects.filter(pk=pedido.pk).update(
+                fecha_creacion=base + timedelta(seconds=seconds),
+            )
+        self.preparaciones[Sector.Nombre.BARRA].estado = (
+            PreparacionPedidoSector.Estado.EN_PREPARACION
+        )
+        self.preparaciones[Sector.Nombre.BARRA].save(update_fields=["estado"])
+        self.client.force_authenticate(user=self.usuario_barra)
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(
+            [item["pedido"] for item in response.data],
+            [pedidos[1].pk, pedidos[2].pk, pedidos[0].pk],
+        )
+
 
 class RetiroPedidoAPITests(APITestCase):
     def setUp(self):
@@ -2180,7 +2383,6 @@ class RetiroPedidoAPITests(APITestCase):
         self.categoria = Categoria.objects.create(nombre="Productos retiro")
         self.control_url = reverse("barra-retiros-list")
         self.avisos_url = reverse("aviso-retiro-list")
-        self.avisos_leidos_url = reverse("aviso-retiro-marcar-leidos")
 
     def crear_pedido(
         self,
@@ -2224,6 +2426,9 @@ class RetiroPedidoAPITests(APITestCase):
     def confirmacion_url(self, pedido):
         return reverse("barra-retiro-confirmar", args=[pedido.pk])
 
+    def aviso_leido_url(self, aviso):
+        return reverse("aviso-retiro-marcar-leido", args=[aviso.pk])
+
     def marcar_lista(self, preparacion):
         usuarios = {
             Sector.Nombre.BARRA: self.usuario_barra,
@@ -2233,10 +2438,15 @@ class RetiroPedidoAPITests(APITestCase):
         self.client.force_authenticate(
             user=usuarios[preparacion.sector.nombre],
         )
-        for estado in [
-            PreparacionPedidoSector.Estado.EN_PREPARACION,
-            PreparacionPedidoSector.Estado.LISTO,
-        ]:
+        estados = (
+            [PreparacionPedidoSector.Estado.LISTO]
+            if preparacion.sector.nombre == Sector.Nombre.BARRA
+            else [
+                PreparacionPedidoSector.Estado.EN_PREPARACION,
+                PreparacionPedidoSector.Estado.LISTO,
+            ]
+        )
+        for estado in estados:
             response = self.client.patch(
                 self.estado_url(preparacion),
                 {"estado": estado},
@@ -2248,7 +2458,7 @@ class RetiroPedidoAPITests(APITestCase):
         self.client.force_authenticate(user=usuario or self.usuario_barra)
         return self.client.post(self.confirmacion_url(pedido), format="json")
 
-    def test_barra_only_enables_retiro_when_its_preparation_becomes_ready(self):
+    def test_barra_only_ready_creates_only_barra_notice(self):
         pedido, preparaciones = self.crear_pedido(
             [self.barra],
             47,
@@ -2258,11 +2468,13 @@ class RetiroPedidoAPITests(APITestCase):
         self.marcar_lista(preparaciones[Sector.Nombre.BARRA])
 
         pedido.refresh_from_db()
-        aviso = AvisoRetiro.objects.get(pedido=pedido)
-        self.assertIsNotNone(pedido.retiro_habilitado_en)
-        self.assertEqual(pedido.retiro_habilitado_por, self.usuario_barra)
+        avisos = list(AvisoRetiro.objects.filter(pedido=pedido))
+        self.assertEqual(len(avisos), 1)
+        aviso = avisos[0]
+        self.assertEqual(aviso.origen, AvisoRetiro.Origen.BARRA)
+        self.assertEqual(aviso.generado_por, self.usuario_barra)
         self.assertEqual(aviso.destinatario, self.mozo)
-        self.assertEqual(aviso.mensaje, "Vereda A · Mesa 47")
+        self.assertEqual(aviso.mensaje, "Vereda A · Mesa 47 — Barra lista")
         self.assertNotEqual(pedido.mesa_id, pedido.mesa.numero)
 
     def test_kitchen_only_order_can_be_manually_confirmed_while_preparations_are_pending(self):
@@ -2273,7 +2485,6 @@ class RetiroPedidoAPITests(APITestCase):
 
         pedido.refresh_from_db()
         self.assertFalse(pedido.cocina_lista)
-        self.assertIsNone(pedido.retiro_habilitado_en)
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
         self.client.force_authenticate(user=self.usuario_barra)
@@ -2306,19 +2517,8 @@ class RetiroPedidoAPITests(APITestCase):
             "precio_unitario",
             response.data[0]["productos_cocina"][0],
         )
-        self.assertEqual(
-            response.data[0]["estados_sectores"],
-            [
-                {"sector": Sector.Nombre.PIZZA, "estado": "PENDIENTE"},
-                {"sector": Sector.Nombre.PLATOS, "estado": "PENDIENTE"},
-            ],
-        )
-        self.assertTrue(response.data[0]["puede_habilitar_retiro"])
-
         confirmation = self.confirmar_retiro(pedido)
         self.assertEqual(confirmation.status_code, status.HTTP_200_OK)
-        pedido.refresh_from_db()
-        self.assertEqual(pedido.retiro_habilitado_por, self.usuario_barra)
         for preparacion in preparaciones.values():
             preparacion.refresh_from_db()
             self.assertEqual(
@@ -2327,9 +2527,10 @@ class RetiroPedidoAPITests(APITestCase):
             )
         self.assertEqual(self.client.get(self.control_url).data, [])
         aviso = AvisoRetiro.objects.get(pedido=pedido)
-        self.assertEqual(aviso.mensaje, "Salón · Mesa 48")
+        self.assertEqual(aviso.origen, AvisoRetiro.Origen.COCINA)
+        self.assertEqual(aviso.mensaje, "Salón · Mesa 48 — Cocina lista")
 
-    def test_mixed_order_requires_barra_ready_but_not_digital_kitchen_readiness(self):
+    def test_mixed_barra_can_be_ready_while_kitchen_is_pending(self):
         pedido, preparaciones = self.crear_pedido(
             [self.barra, self.pizza],
             49,
@@ -2338,39 +2539,135 @@ class RetiroPedidoAPITests(APITestCase):
         self.client.force_authenticate(user=self.usuario_barra)
         pending_items = self.client.get(self.control_url)
         self.assertEqual(len(pending_items.data), 1)
-        self.assertFalse(pending_items.data[0]["puede_habilitar_retiro"])
         self.assertEqual(
             pending_items.data[0]["productos_cocina"][0]["sector"],
             Sector.Nombre.PIZZA,
         )
-        premature_confirmation = self.confirmar_retiro(pedido)
-        self.assertEqual(
-            premature_confirmation.status_code,
-            status.HTTP_400_BAD_REQUEST,
-        )
-
-        pedido.refresh_from_db()
-        self.assertIsNone(pedido.retiro_habilitado_en)
-        self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
         self.marcar_lista(preparaciones[Sector.Nombre.BARRA])
-        pedido.refresh_from_db()
-        self.assertIsNone(pedido.retiro_habilitado_en)
-        self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
-        preparacion_cocina = preparaciones[Sector.Nombre.PIZZA]
+        self.assertTrue(
+            AvisoRetiro.objects.filter(
+                pedido=pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+            ).exists(),
+        )
+
+    def test_recepcion_usa_cantidad_vigente_y_no_oculta_otro_origen(self):
+        pedido, _ = self.crear_pedido([self.barra, self.pizza], 105)
+        detalle_barra = pedido.detalles.get(
+            sector_destino=self.barra,
+        )
+        detalle_barra.cantidad = 6
+        detalle_barra.save(update_fields=["cantidad"])
+        for estado, cantidad in [
+            (SolicitudCancelacionDetalle.Estado.ACEPTADA, 2),
+            (SolicitudCancelacionDetalle.Estado.PENDIENTE, 1),
+            (SolicitudCancelacionDetalle.Estado.RECHAZADA, 1),
+        ]:
+            SolicitudCancelacionDetalle.objects.create(
+                detalle=detalle_barra,
+                solicitante=self.mozo,
+                clave_idempotencia=uuid4(),
+                cantidad=cantidad,
+                motivo=f"Cancelación {estado.lower()}",
+                estado=estado,
+                resuelto_por=(
+                    self.usuario_barra
+                    if estado != SolicitudCancelacionDetalle.Estado.PENDIENTE
+                    else None
+                ),
+            )
+        self.client.force_authenticate(user=self.usuario_barra)
+
+        response = self.client.get(self.control_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order = next(item for item in response.data if item["pedido"] == pedido.pk)
+        self.assertEqual(
+            order["productos_cocina"],
+            [
+                {
+                    "producto_nombre": f"Producto {Sector.Nombre.PIZZA} mesa 105",
+                    "cantidad": 1,
+                    "sector": Sector.Nombre.PIZZA,
+                },
+            ],
+        )
+
+    def test_cocina_totalmente_cancelada_no_aparece_ni_admite_aviso(self):
+        pedido, _ = self.crear_pedido([self.pizza, self.platos], 106)
+        for detalle in pedido.detalles.all():
+            SolicitudCancelacionDetalle.objects.create(
+                detalle=detalle,
+                solicitante=self.mozo,
+                clave_idempotencia=uuid4(),
+                cantidad=detalle.cantidad,
+                motivo="Cancelación total",
+                estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+                resuelto_por=self.usuario_barra,
+            )
+
+        self.client.force_authenticate(user=self.cocina_pizza)
+        preparation_response = self.client.get(
+            reverse("detalle-preparacion-list"),
+        )
+        self.assertEqual(preparation_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(preparation_response.data, [])
+
+        self.client.force_authenticate(user=self.usuario_barra)
+        response = self.client.get(self.control_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            any(item["pedido"] == pedido.pk for item in response.data),
+        )
+        confirmation = self.confirmar_retiro(pedido)
+        self.assertEqual(confirmation.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            AvisoRetiro.objects.filter(
+                pedido=pedido,
+                origen=AvisoRetiro.Origen.COCINA,
+            ).exists(),
+        )
+
+    def test_recepciones_se_ordenan_por_llegada_y_id_estable(self):
+        pedidos = []
+        preparaciones = {}
+        for numero in [107, 108, 109]:
+            pedido, preparaciones_pedido = self.crear_pedido(
+                [self.pizza],
+                numero,
+            )
+            pedidos.append(pedido)
+            preparaciones[pedido.pk] = preparaciones_pedido
+
+        base = timezone.now()
+        for pedido, seconds in zip(pedidos, [20, 0, 10]):
+            Pedido.objects.filter(pk=pedido.pk).update(
+                fecha_creacion=base + timedelta(seconds=seconds),
+            )
+        self.client.force_authenticate(user=self.usuario_barra)
+
+        response = self.client.get(self.control_url)
+
+        self.assertEqual(
+            [item["pedido"] for item in response.data],
+            [pedidos[1].pk, pedidos[2].pk, pedidos[0].pk],
+        )
+        preparacion_cocina = preparaciones[pedidos[1].pk][
+            Sector.Nombre.PIZZA
+        ]
         preparacion_cocina.refresh_from_db()
         self.assertEqual(
             preparacion_cocina.estado,
             PreparacionPedidoSector.Estado.PENDIENTE,
         )
 
-        response = self.confirmar_retiro(pedido)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        updated = self.client.get(self.control_url)
         self.assertEqual(
-            AvisoRetiro.objects.get(pedido=pedido).mensaje,
-            "Salón · Mesa 49",
+            [item["pedido"] for item in updated.data],
+            [pedidos[1].pk, pedidos[2].pk, pedidos[0].pk],
         )
-        self.assertEqual(self.client.get(self.control_url).data, [])
 
     def test_kitchen_only_products_from_both_sectors_do_not_require_digital_readiness(self):
         pedido, preparaciones = self.crear_pedido(
@@ -2383,7 +2680,6 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         pedido.refresh_from_db()
         self.assertFalse(pedido.cocina_lista)
-        self.assertIsNotNone(pedido.retiro_habilitado_en)
         self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
         self.assertTrue(
             all(
@@ -2392,16 +2688,132 @@ class RetiroPedidoAPITests(APITestCase):
             ),
         )
 
-    def test_mixed_order_with_barra_pending_cannot_be_confirmed(self):
-        pedido, _ = self.crear_pedido([self.barra, self.pizza], 51)
+    def test_mixed_order_can_confirm_cocina_while_barra_is_pending(self):
+        pedido, preparaciones = self.crear_pedido([self.barra, self.pizza], 51)
 
         response = self.confirmar_retiro(pedido)
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        pedido.refresh_from_db()
-        self.assertIsNone(pedido.retiro_habilitado_en)
-        self.assertIsNone(pedido.retiro_habilitado_por_id)
-        self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            AvisoRetiro.objects.get(pedido=pedido).origen,
+            AvisoRetiro.Origen.COCINA,
+        )
+        self.assertEqual(len(self.client.get(self.control_url).data), 0)
+        barra_tasks = self.client.get(
+            reverse("detalle-preparacion-list"),
+        ).data
+        self.assertEqual(len(barra_tasks), 1)
+        self.assertEqual(barra_tasks[0]["estado"], "PENDIENTE")
+        self.assertEqual(
+            preparaciones[Sector.Nombre.BARRA].estado,
+            PreparacionPedidoSector.Estado.PENDIENTE,
+        )
+
+    def test_both_origins_are_independent_in_either_completion_order(self):
+        barra_first, barra_first_preparations = self.crear_pedido(
+            [self.barra, self.pizza],
+            63,
+        )
+        self.marcar_lista(barra_first_preparations[Sector.Nombre.BARRA])
+        self.assertEqual(
+            len(self.client.get(self.control_url).data),
+            1,
+            "Barra listo no debe retirar la tarea de recepción de Cocina.",
+        )
+        self.assertEqual(
+            self.confirmar_retiro(barra_first).status_code,
+            status.HTTP_200_OK,
+        )
+
+        cocina_first, cocina_first_preparations = self.crear_pedido(
+            [self.barra, self.platos],
+            64,
+        )
+        self.assertEqual(
+            self.confirmar_retiro(cocina_first).status_code,
+            status.HTTP_200_OK,
+        )
+        self.client.force_authenticate(user=self.usuario_barra)
+        barra_tasks = self.client.get(
+            reverse("detalle-preparacion-list"),
+        ).data
+        self.assertTrue(any(
+            task["pedido"] == cocina_first.pk
+            and task["estado"] == "PENDIENTE"
+            for task in barra_tasks
+        ))
+        self.marcar_lista(cocina_first_preparations[Sector.Nombre.BARRA])
+
+        for pedido in [barra_first, cocina_first]:
+            self.assertEqual(
+                set(
+                    AvisoRetiro.objects.filter(pedido=pedido).values_list(
+                        "origen",
+                        flat=True,
+                    ),
+                ),
+                {AvisoRetiro.Origen.BARRA, AvisoRetiro.Origen.COCINA},
+            )
+            self.assertEqual(
+                AvisoRetiro.objects.filter(pedido=pedido).count(),
+                2,
+            )
+        self.client.force_authenticate(user=self.mozo)
+        notices = self.client.get(self.avisos_url).data
+        self.assertEqual(len(notices), 4)
+        self.assertEqual(
+            {
+                (notice["pedido"], notice["origen"])
+                for notice in notices
+            },
+            {
+                (pedido.pk, origin)
+                for pedido in [barra_first, cocina_first]
+                for origin in [
+                    AvisoRetiro.Origen.BARRA,
+                    AvisoRetiro.Origen.COCINA,
+                ]
+            },
+        )
+        self.assertIn(
+            "Salón · Mesa 63 — Barra lista",
+            {notice["mensaje"] for notice in notices},
+        )
+        self.assertIn(
+            "Salón · Mesa 63 — Cocina lista",
+            {notice["mensaje"] for notice in notices},
+        )
+
+    def test_database_enforces_one_notice_per_origin_and_one_ambiguous_notice(self):
+            pedido, _ = self.crear_pedido([self.barra, self.pizza], 66)
+            AvisoRetiro.objects.create(
+                pedido=pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+                destinatario=self.mozo,
+                mensaje="Barra",
+            )
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    AvisoRetiro.objects.create(
+                        pedido=pedido,
+                        origen=AvisoRetiro.Origen.BARRA,
+                        destinatario=self.mozo,
+                        mensaje="Duplicado",
+                    )
+            AvisoRetiro.objects.create(
+                pedido=pedido,
+                origen=None,
+                destinatario=self.mozo,
+                mensaje="Origen histórico desconocido",
+            )
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    AvisoRetiro.objects.create(
+                        pedido=pedido,
+                        origen=None,
+                        destinatario=self.mozo,
+                        mensaje="Duplicado ambiguo",
+                    )
 
     def test_kitchen_only_order_does_not_require_digital_preparation_records(self):
         pedido, _ = self.crear_pedido([self.pizza], 52)
@@ -2410,8 +2822,6 @@ class RetiroPedidoAPITests(APITestCase):
         response = self.confirmar_retiro(pedido)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pedido.refresh_from_db()
-        self.assertIsNotNone(pedido.retiro_habilitado_en)
         self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
 
     def test_order_without_preparations_cannot_be_enabled_or_listed(self):
@@ -2421,8 +2831,6 @@ class RetiroPedidoAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.client.get(self.control_url).data, [])
-        pedido.refresh_from_db()
-        self.assertIsNone(pedido.retiro_habilitado_en)
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
     def test_repeated_confirmation_preserves_original_bar_user_and_timestamp(self):
@@ -2430,19 +2838,18 @@ class RetiroPedidoAPITests(APITestCase):
         first_response = self.confirmar_retiro(pedido)
         self.assertEqual(first_response.status_code, status.HTTP_200_OK)
 
-        pedido.refresh_from_db()
-        aviso = AvisoRetiro.objects.get(pedido=pedido)
-        fecha_original = pedido.retiro_habilitado_en
+        aviso = AvisoRetiro.objects.get(
+            pedido=pedido,
+            origen=AvisoRetiro.Origen.COCINA,
+        )
         fecha_aviso_original = aviso.fecha_creacion
         self.assertEqual(self.client.get(self.control_url).data, [])
         otro_usuario = self.otra_barra
         second_response = self.confirmar_retiro(pedido, otro_usuario)
 
         self.assertEqual(second_response.status_code, status.HTTP_200_OK)
-        pedido.refresh_from_db()
         aviso.refresh_from_db()
-        self.assertEqual(pedido.retiro_habilitado_en, fecha_original)
-        self.assertEqual(pedido.retiro_habilitado_por, self.usuario_barra)
+        self.assertEqual(aviso.generado_por, self.usuario_barra)
         self.assertEqual(aviso.fecha_creacion, fecha_aviso_original)
         self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
 
@@ -2454,8 +2861,6 @@ class RetiroPedidoAPITests(APITestCase):
         response = self.confirmar_retiro(pedido)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pedido.refresh_from_db()
-        self.assertIsNotNone(pedido.retiro_habilitado_en)
 
     def test_notice_failure_rolls_back_retiro_habilitation(self):
         pedido, preparaciones = self.crear_pedido([self.pizza], 56)
@@ -2466,9 +2871,6 @@ class RetiroPedidoAPITests(APITestCase):
             with self.assertRaises(RuntimeError):
                 self.client.post(self.confirmacion_url(pedido), format="json")
 
-        pedido.refresh_from_db()
-        self.assertIsNone(pedido.retiro_habilitado_en)
-        self.assertIsNone(pedido.retiro_habilitado_por_id)
         self.assertFalse(AvisoRetiro.objects.filter(pedido=pedido).exists())
 
     def test_bar_control_uses_username_when_waiter_has_no_name(self):
@@ -2514,61 +2916,78 @@ class RetiroPedidoAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["pedido"], primer_pedido.pk)
-        self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 57")
+        self.assertEqual(response.data[0]["origen"], AvisoRetiro.Origen.COCINA)
+        self.assertEqual(
+            response.data[0]["mensaje"],
+            "Salón · Mesa 57 — Cocina lista",
+        )
         self.assertFalse(response.data[0]["leido"])
 
         self.client.force_authenticate(user=self.otro_mozo)
         response = self.client.get(self.avisos_url)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["pedido"], segundo_pedido.pk)
-        self.assertEqual(response.data[0]["mensaje"], "Salón · Mesa 58")
+        self.assertEqual(
+            response.data[0]["mensaje"],
+            "Salón · Mesa 58 — Cocina lista",
+        )
         self.assertFalse(response.data[0]["leido"])
 
-    def test_mozo_can_persistently_mark_only_own_retirement_notices_as_read(self):
-        primer_pedido, _ = self.crear_pedido([self.pizza], 61)
-        segundo_pedido, _ = self.crear_pedido(
-            [self.platos],
-            62,
-            mozo=self.otro_mozo,
-        )
-        self.confirmar_retiro(primer_pedido)
-        self.confirmar_retiro(segundo_pedido)
+    def test_reading_one_origin_notice_does_not_mark_the_other_as_read(self):
+        pedido, preparaciones = self.crear_pedido([self.barra, self.pizza], 61)
+        self.marcar_lista(preparaciones[Sector.Nombre.BARRA])
+        self.confirmar_retiro(pedido)
 
         self.client.force_authenticate(user=self.mozo)
-        own_notices = self.client.get(self.avisos_url)
-        self.assertEqual(len(own_notices.data), 1)
-        self.assertEqual(own_notices.data[0]["pedido"], primer_pedido.pk)
-        self.assertEqual(own_notices.data[0]["mensaje"], "Salón · Mesa 61")
-        self.assertFalse(own_notices.data[0]["leido"])
-
-        marked = self.client.post(self.avisos_leidos_url, format="json")
+        notices = self.client.get(self.avisos_url).data
+        self.assertEqual(len(notices), 2)
+        barra_notice = AvisoRetiro.objects.get(
+            pedido=pedido,
+            origen=AvisoRetiro.Origen.BARRA,
+        )
+        marked = self.client.post(self.aviso_leido_url(barra_notice), format="json")
         self.assertEqual(marked.status_code, status.HTTP_200_OK)
         self.assertEqual(marked.data, {"actualizados": 1})
-        own_notices = self.client.get(self.avisos_url)
-        self.assertEqual(len(own_notices.data), 1)
-        self.assertTrue(own_notices.data[0]["leido"])
-        self.assertIsNotNone(
-            AvisoRetiro.objects.get(pedido=primer_pedido).leido_en,
-        )
-        self.assertIsNone(
-            AvisoRetiro.objects.get(pedido=segundo_pedido).leido_en,
-        )
-
-        second_mark = self.client.post(self.avisos_leidos_url, format="json")
-        self.assertEqual(second_mark.status_code, status.HTTP_200_OK)
-        self.assertEqual(second_mark.data, {"actualizados": 0})
-
         self.client.force_authenticate(user=self.otro_mozo)
-        other_notices = self.client.get(self.avisos_url)
-        self.assertEqual(len(other_notices.data), 1)
-        self.assertEqual(other_notices.data[0]["pedido"], segundo_pedido.pk)
-        self.assertFalse(other_notices.data[0]["leido"])
         self.assertEqual(
-            self.client.post(self.avisos_leidos_url, format="json").data,
-            {"actualizados": 1},
+            self.client.post(
+                self.aviso_leido_url(
+                    AvisoRetiro.objects.get(
+                        pedido=pedido,
+                        origen=AvisoRetiro.Origen.COCINA,
+                    ),
+                ),
+                format="json",
+            ).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        self.client.force_authenticate(user=self.mozo)
+        notices = self.client.get(self.avisos_url).data
+        self.assertTrue(next(
+            notice for notice in notices
+            if notice["origen"] == AvisoRetiro.Origen.BARRA
+        )["leido"])
+        self.assertFalse(next(
+            notice for notice in notices
+            if notice["origen"] == AvisoRetiro.Origen.COCINA
+        )["leido"])
+        barra_notice.refresh_from_db()
+        self.assertIsNotNone(barra_notice.leido_en)
+        self.assertIsNone(
+            AvisoRetiro.objects.get(
+                pedido=pedido,
+                origen=AvisoRetiro.Origen.COCINA,
+            ).leido_en,
         )
 
     def test_retirement_notice_routes_are_mozo_only(self):
+        pedido, _ = self.crear_pedido([self.pizza], 59)
+        self.assertEqual(
+            self.confirmar_retiro(pedido).status_code,
+            status.HTTP_200_OK,
+        )
+        aviso = AvisoRetiro.objects.get(pedido=pedido)
         for usuario in [
             self.usuario_barra,
             self.cocina_pizza,
@@ -2579,7 +2998,12 @@ class RetiroPedidoAPITests(APITestCase):
                 self.client.force_authenticate(user=usuario)
                 for response in [
                     self.client.get(self.avisos_url),
-                    self.client.post(self.avisos_leidos_url, format="json"),
+                    self.client.post(
+                        self.aviso_leido_url(
+                            aviso,
+                        ),
+                        format="json",
+                    ),
                 ]:
                     self.assertIn(
                         response.status_code,
@@ -2613,6 +3037,106 @@ class RetiroPedidoAPITests(APITestCase):
             self.client.get(self.avisos_url).status_code,
             status.HTTP_403_FORBIDDEN,
         )
+
+
+class AvisoRetiroOriginMigrationTests(TransactionTestCase):
+    migrate_from = [("pedidos", "0012_lecturanotificacioncancelacion")]
+    migrate_to = [
+        ("pedidos", "0013_remove_avisoretiro_unique_aviso_retiro_por_pedido_and_more"),
+    ]
+
+    def setUp(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_from)
+        old_apps = executor.loader.project_state(self.migrate_from).apps
+        SectorHistorico = old_apps.get_model("usuarios", "Sector")
+        UserHistorico = old_apps.get_model("usuarios", "User")
+        MesaHistorica = old_apps.get_model("pedidos", "Mesa")
+        CuentaHistorica = old_apps.get_model("pedidos", "Cuenta")
+        PedidoHistorico = old_apps.get_model("pedidos", "Pedido")
+        AvisoHistorico = old_apps.get_model("pedidos", "AvisoRetiro")
+        CategoriaHistorica = old_apps.get_model("productos", "Categoria")
+        ProductoHistorico = old_apps.get_model("productos", "Producto")
+        DetalleHistorico = old_apps.get_model("pedidos", "DetallePedido")
+
+        barra = SectorHistorico.objects.create(nombre="BARRA")
+        pizza = SectorHistorico.objects.create(nombre="PIZZA")
+        mozo = UserHistorico.objects.create(
+            username="mozo_aviso_historico",
+            password="",
+            rol="MOZO",
+        )
+        categoria = CategoriaHistorica.objects.create(nombre="Histórico")
+        leido_en = timezone.now()
+
+        def crear_aviso(numero_mesa, sectores):
+            mesa = MesaHistorica.objects.create(numero=numero_mesa)
+            cuenta = CuentaHistorica.objects.create(mesa=mesa)
+            pedido = PedidoHistorico.objects.create(
+                mesa=mesa,
+                mozo=mozo,
+                cuenta=cuenta,
+                retiro_habilitado_en=leido_en,
+                retiro_habilitado_por=mozo,
+            )
+            for sector in sectores:
+                producto = ProductoHistorico.objects.create(
+                    nombre=f"Histórico {numero_mesa} {sector.nombre}",
+                    precio=Decimal("100.00"),
+                    categoria=categoria,
+                    sector_destino=sector,
+                )
+                DetalleHistorico.objects.create(
+                    pedido=pedido,
+                    producto=producto,
+                    sector_destino=sector,
+                    cantidad=1,
+                    precio_unitario=Decimal("100.00"),
+                )
+            AvisoHistorico.objects.create(
+                pedido=pedido,
+                destinatario=mozo,
+                mensaje=f"Salón · Mesa {numero_mesa}",
+                leido_en=leido_en,
+            )
+            return pedido.pk
+
+        self.pedido_barra = crear_aviso(1, [barra])
+        self.pedido_mixto = crear_aviso(2, [barra, pizza])
+        self.pedido_ambiguo = crear_aviso(3, [])
+        self.fecha_lectura = leido_en
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_to)
+        migrated_apps = executor.loader.project_state(self.migrate_to).apps
+        AvisoActual = migrated_apps.get_model("pedidos", "AvisoRetiro")
+        self.avisos = {
+            aviso.pedido_id: aviso
+            for aviso in AvisoActual.objects.all()
+        }
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_migration_preserves_notice_data_and_classifies_only_proven_origins(self):
+        self.assertEqual(len(self.avisos), 3)
+        barra = self.avisos[self.pedido_barra]
+        self.assertEqual(barra.origen, "BARRA")
+        self.assertEqual(barra.mensaje, "Salón · Mesa 1 — Barra lista")
+
+        cocina = self.avisos[self.pedido_mixto]
+        self.assertEqual(cocina.origen, "COCINA")
+        self.assertEqual(cocina.mensaje, "Salón · Mesa 2 — Cocina lista")
+
+        ambiguo = self.avisos[self.pedido_ambiguo]
+        self.assertIsNone(ambiguo.origen)
+        self.assertEqual(ambiguo.mensaje, "Salón · Mesa 3")
+        for aviso in self.avisos.values():
+            self.assertEqual(aviso.destinatario_id, barra.destinatario_id)
+            self.assertEqual(aviso.generado_por_id, barra.destinatario_id)
+            self.assertEqual(aviso.leido_en, self.fecha_lectura)
 
 
 class CuentaConsumoAPITests(APITestCase):
@@ -3032,34 +3556,37 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         unassigned = self.solicitar()
         self.assertEqual(unassigned.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_cantidad_positiva_motivo_obligatorio_y_reserva_pendiente(self):
+    def test_cantidad_positiva_motivo_opcional_y_reserva_pendiente(self):
         self.client.force_authenticate(user=self.mozo)
         clave_idempotencia = uuid4()
-        for payload in [
+        invalid = self.client.post(
+            self.solicitar_url,
             {
                 "clave_idempotencia": uuid4(),
                 "cantidad": 0,
-                "motivo": "Inválido",
             },
-            {
-                "clave_idempotencia": uuid4(),
-                "cantidad": 1,
-                "motivo": "   ",
-            },
-        ]:
-            with self.subTest(payload=payload):
-                response = self.client.post(
-                    self.solicitar_url,
-                    payload,
-                    format="json",
-                )
-                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            format="json",
+        )
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
 
-        pending = self.solicitar(
-            cantidad=3,
-            clave_idempotencia=clave_idempotencia,
+        payload = {
+            "clave_idempotencia": clave_idempotencia,
+            "cantidad": 3,
+        }
+        pending = self.client.post(
+            self.solicitar_url,
+            payload,
+            format="json",
         )
         self.assertEqual(pending.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(pending.data["motivo"], "")
+        repeated = self.client.post(
+            self.solicitar_url,
+            payload,
+            format="json",
+        )
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+        self.assertEqual(repeated.data["id"], pending.data["id"])
         excessive = self.solicitar(
             cantidad=2,
             clave_idempotencia=uuid4(),
@@ -3809,3 +4336,300 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         self.assertEqual(detail["cantidad_cancelada"], 0)
         self.assertEqual(detail["solicitudes_cancelacion"], [])
         self.assertEqual(Decimal(response.data["total"]), Decimal("2400.00"))
+    def test_estado_entrega_se_separa_por_origen_y_leer_aviso_no_lo_cambia(self):
+        productos_por_sector = {}
+        for indice, sector in enumerate([self.pizza, self.platos], start=1):
+            producto = Producto.objects.create(
+                nombre=f"Producto de cocina {indice}",
+                precio=Decimal("800.00"),
+                categoria=self.categoria,
+                sector_destino=sector,
+            )
+            DetallePedido.objects.create(
+                pedido=self.pedido,
+                producto=producto,
+                cantidad=2,
+            )
+            productos_por_sector[sector.nombre] = producto
+
+        self.client.force_authenticate(user=self.mozo)
+        initial = self.consultar_consumo()
+        self.assertEqual(initial.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            all(
+                detail["estado_entrega"] == "PENDIENTE"
+                and detail["puede_solicitar_cancelacion"]
+                for order in initial.data["pedidos"]
+                for detail in order["detalles"]
+            )
+        )
+
+        barra_aviso = AvisoRetiro.objects.create(
+            pedido=self.pedido,
+            origen=AvisoRetiro.Origen.BARRA,
+            destinatario=self.mozo,
+            mensaje="Barra lista",
+        )
+        consumo = self.consultar_consumo()
+        detalles = {
+            detail["producto"]: detail
+            for order in consumo.data["pedidos"]
+            for detail in order["detalles"]
+        }
+        self.assertEqual(detalles[self.producto.pk]["estado_entrega"], "ENTREGADO")
+        self.assertFalse(
+            detalles[self.producto.pk]["puede_solicitar_cancelacion"],
+        )
+        self.assertEqual(
+            detalles[self.producto.pk]["cantidad_disponible_cancelacion"],
+            0,
+        )
+        for sector in [self.pizza, self.platos]:
+            detail = detalles[productos_por_sector[sector.nombre].pk]
+            self.assertEqual(detail["estado_entrega"], "PENDIENTE")
+            self.assertTrue(detail["puede_solicitar_cancelacion"])
+
+        avisos = self.client.get(reverse("aviso-retiro-list"))
+        self.assertEqual(avisos.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.client.post(
+                reverse("aviso-retiro-marcar-leido", args=[barra_aviso.pk]),
+                format="json",
+            ).status_code,
+            status.HTTP_200_OK,
+        )
+        details_after_read = {
+            detail["producto"]: detail["estado_entrega"]
+            for detail in self.consultar_consumo().data["pedidos"][0]["detalles"]
+        }
+        self.assertEqual(
+            details_after_read[self.producto.pk],
+            "ENTREGADO",
+        )
+
+        AvisoRetiro.objects.create(
+            pedido=self.pedido,
+            origen=AvisoRetiro.Origen.COCINA,
+            destinatario=self.mozo,
+            mensaje="Cocina lista",
+        )
+        consumo = self.consultar_consumo()
+        detalles = {
+            detail["producto"]: detail
+            for order in consumo.data["pedidos"]
+            for detail in order["detalles"]
+        }
+        for sector in [self.pizza, self.platos]:
+            detail = detalles[productos_por_sector[sector.nombre].pk]
+            self.assertEqual(detail["estado_entrega"], "ENTREGADO")
+            self.assertFalse(detail["puede_solicitar_cancelacion"])
+
+    def test_aviso_historico_sin_origen_no_atribuye_entrega(self):
+        AvisoRetiro.objects.create(
+            pedido=self.pedido,
+            origen=None,
+            destinatario=self.mozo,
+            mensaje="Salón · Mesa histórica",
+        )
+
+        response = self.consultar_consumo()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        detail = response.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["estado_entrega"], "PENDIENTE")
+        self.assertTrue(detail["puede_solicitar_cancelacion"])
+
+    def test_producto_entregado_rechaza_nuevas_cancelaciones_y_reintenta_idempotente(self):
+        self.client.force_authenticate(user=self.mozo)
+        key = uuid4()
+        created = self.solicitar(cantidad=1, clave_idempotencia=key)
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        AvisoRetiro.objects.create(
+            pedido=self.pedido,
+            origen=AvisoRetiro.Origen.BARRA,
+            destinatario=self.mozo,
+            mensaje="Barra lista",
+        )
+
+        repeated = self.solicitar(cantidad=1, clave_idempotencia=key)
+        rejected = self.solicitar(cantidad=1, clave_idempotencia=uuid4())
+
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+        self.assertEqual(repeated.data["id"], created.data["id"])
+        self.assertEqual(rejected.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            SolicitudCancelacionDetalle.objects.filter(
+                detalle=self.detalle,
+            ).count(),
+            1,
+        )
+        detail = self.consultar_consumo().data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["estado_entrega"], "ENTREGADO")
+        self.assertEqual(detail["cantidad_pendiente"], 1)
+        self.assertEqual(detail["cantidad_disponible_cancelacion"], 0)
+
+    def test_producto_totalmente_cancelado_conserva_historial_y_no_parece_pendiente(self):
+        self.detalle.cantidad = 4
+        self.detalle.save(update_fields=["cantidad"])
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=4,
+            motivo="Cancelación total",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.barra_user,
+        )
+
+        response = self.consultar_consumo()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        detail = response.data["pedidos"][0]["detalles"][0]
+        self.assertEqual(detail["estado_entrega"], "CANCELADO")
+        self.assertFalse(detail["puede_solicitar_cancelacion"])
+        self.assertEqual(detail["cantidad_vigente"], 0)
+        self.assertEqual(Decimal(detail["subtotal"]), Decimal("0.00"))
+        self.assertEqual(Decimal(response.data["total"]), Decimal("0.00"))
+        self.assertEqual(len(detail["solicitudes_cancelacion"]), 1)
+
+    def test_solicitudes_pendientes_se_ordenan_de_mas_antigua_a_mas_nueva(self):
+        self.client.force_authenticate(user=self.mozo)
+        created = [
+            self.solicitar(cantidad=1, clave_idempotencia=uuid4())
+            for _ in range(3)
+        ]
+        self.assertTrue(
+            all(response.status_code == status.HTTP_201_CREATED for response in created)
+        )
+        base = timezone.now()
+        for response, seconds in zip(created, [20, 0, 10]):
+            SolicitudCancelacionDetalle.objects.filter(
+                pk=response.data["id"],
+            ).update(fecha_solicitud=base + timedelta(seconds=seconds))
+
+        self.client.force_authenticate(user=self.barra_user)
+        pending = self.client.get(self.pendientes_url)
+
+        self.assertEqual(pending.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [request["id"] for request in pending.data],
+            [created[1].data["id"], created[2].data["id"], created[0].data["id"]],
+        )
+
+
+class AvisoCancelacionConcurrenteTests(TransactionTestCase):
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_cancelacion_que_compite_con_aviso_espera_y_luego_se_rechaza(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        mozo = User.objects.create_user(
+            username="mozo_concurrente",
+            password="clave-segura",
+            rol=User.Rol.MOZO,
+            sector=salon,
+        )
+        usuario_barra = User.objects.create_user(
+            username="barra_concurrente",
+            password="clave-segura",
+            rol=User.Rol.BARRA,
+            sector=barra,
+        )
+        mesa = Mesa.objects.create(numero=120)
+        cuenta = Cuenta.objects.create(
+            mesa=mesa,
+            mozo_responsable=mozo,
+        )
+        categoria = Categoria.objects.create(nombre="Concurrentes")
+        producto = Producto.objects.create(
+            nombre="Bebida concurrente",
+            precio=Decimal("100.00"),
+            categoria=categoria,
+            sector_destino=barra,
+        )
+        pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
+        detalle = DetallePedido.objects.create(
+            pedido=pedido,
+            producto=producto,
+            cantidad=1,
+        )
+        lock_acquired = Event()
+        request_started = Event()
+        release_lock = Event()
+        thread_errors = []
+        request_result = []
+        idempotency_key = uuid4()
+
+        def emitir_aviso():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    Cuenta.objects.select_for_update().get(pk=cuenta.pk)
+                    pedido_bloqueado = Pedido.objects.select_for_update().get(
+                        pk=pedido.pk,
+                    )
+                    lock_acquired.set()
+                    if not release_lock.wait(timeout=5):
+                        raise TimeoutError("No se liberó el bloqueo de la cuenta.")
+                    pedido_bloqueado.crear_aviso_retiro(
+                        AvisoRetiro.Origen.BARRA,
+                        User.objects.get(pk=usuario_barra.pk),
+                    )
+            except Exception as error:
+                thread_errors.append(error)
+            finally:
+                close_old_connections()
+
+        def solicitar_cancelacion():
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=mozo.pk))
+                request_started.set()
+                request_result.append(
+                    client.post(
+                        reverse(
+                            "detalle-solicitar-cancelacion",
+                            args=[cuenta.pk, detalle.pk],
+                        ),
+                        {
+                            "clave_idempotencia": idempotency_key,
+                            "cantidad": 1,
+                            "motivo": "Cancelación concurrente",
+                        },
+                        format="json",
+                    ),
+                )
+            except Exception as error:
+                thread_errors.append(error)
+            finally:
+                close_old_connections()
+
+        notice_thread = Thread(target=emitir_aviso)
+        request_thread = Thread(target=solicitar_cancelacion)
+        notice_thread.start()
+        self.assertTrue(lock_acquired.wait(timeout=5))
+        request_thread.start()
+        try:
+            self.assertTrue(request_started.wait(timeout=5))
+            time.sleep(0.2)
+        finally:
+            release_lock.set()
+
+        notice_thread.join(timeout=10)
+        request_thread.join(timeout=10)
+        self.assertFalse(notice_thread.is_alive())
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertEqual(len(request_result), 1)
+        self.assertEqual(request_result[0].status_code, 400)
+        self.assertTrue(
+            AvisoRetiro.objects.filter(
+                pedido=pedido,
+                origen=AvisoRetiro.Origen.BARRA,
+            ).exists(),
+        )
+        self.assertFalse(
+            SolicitudCancelacionDetalle.objects.filter(
+                clave_idempotencia=idempotency_key,
+            ).exists(),
+        )

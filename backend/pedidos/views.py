@@ -2,6 +2,8 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Exists, OuterRef, Q, Sum, prefetch_related_objects
+from django.db.models import Prefetch
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, serializers, status
@@ -40,6 +42,12 @@ from .serializers import (
     SolicitudCancelacionPendienteSerializer,
     SolicitudCancelacionNotificacionSerializer,
     SolicitudCancelacionSerializer,
+)
+from .services import (
+    cantidad_disponible_cancelacion,
+    detalles_vigentes_exist,
+    detalles_vigentes_de_sector,
+    estado_entrega,
 )
 
 
@@ -139,8 +147,10 @@ class CuentaConsumoView(generics.RetrieveAPIView):
             "pedidos__mozo",
             "pedidos__aviso_carga_barra",
             "pedidos__detalles__producto",
+            "pedidos__detalles__sector_destino",
             "pedidos__detalles__solicitudes_cancelacion__solicitante",
             "pedidos__detalles__solicitudes_cancelacion__resuelto_por",
+            "pedidos__avisos_retiro",
         )
         return cuenta
 
@@ -202,22 +212,42 @@ class SolicitudCancelacionCreateView(generics.GenericAPIView):
             if cuenta.mozo_responsable_id != request.user.pk:
                 self.permission_denied(request)
 
+            pedido_id = (
+                DetallePedido.objects.filter(
+                    pk=kwargs["detalle_id"],
+                    pedido__cuenta=cuenta,
+                )
+                .values_list("pedido_id", flat=True)
+                .first()
+            )
+            if pedido_id is None:
+                raise Http404
+            pedido = get_object_or_404(
+                Pedido.objects.select_for_update(of=("self",)),
+                pk=pedido_id,
+                cuenta=cuenta,
+            )
             detalle = get_object_or_404(
-                DetallePedido.objects.select_for_update(of=("self",)),
+                DetallePedido.objects.select_for_update(of=("self",))
+                .select_related("pedido", "sector_destino"),
                 pk=kwargs["detalle_id"],
-                pedido__cuenta=cuenta,
+                pedido=pedido,
             )
             existente = self.obtener_existente(datos)
             if existente is not None:
                 return existente
 
-            reservadas = detalle.solicitudes_cancelacion.filter(
-                estado__in=[
-                    SolicitudCancelacionDetalle.Estado.PENDIENTE,
-                    SolicitudCancelacionDetalle.Estado.ACEPTADA,
-                ],
-            ).aggregate(total=Sum("cantidad"))["total"] or 0
-            cantidad_disponible = detalle.cantidad - reservadas
+            if estado_entrega(detalle) == "ENTREGADO":
+                raise serializers.ValidationError(
+                    {
+                        "detail": (
+                            "No se pueden solicitar cancelaciones de "
+                            "productos entregados."
+                        )
+                    }
+                )
+
+            cantidad_disponible = cantidad_disponible_cancelacion(detalle)
             if serializer.validated_data["cantidad"] > cantidad_disponible:
                 raise serializers.ValidationError(
                     {
@@ -272,6 +302,7 @@ class SolicitudesCancelacionPendientesView(generics.ListAPIView):
             .prefetch_related(
                 "detalle__solicitudes_cancelacion",
             )
+            .order_by("fecha_solicitud", "pk")
         )
 
 
@@ -374,10 +405,23 @@ class ResolverSolicitudCancelacionView(generics.GenericAPIView):
                 raise serializers.ValidationError(
                     {"detail": "La solicitud de cancelación no existe."},
                 )
+            pedido_id = DetallePedido.objects.filter(
+                pk=detalle_id,
+                pedido__cuenta=cuenta,
+            ).values_list("pedido_id", flat=True).first()
+            if pedido_id is None:
+                raise serializers.ValidationError(
+                    {"detail": "La solicitud de cancelación no existe."},
+                )
+            pedido = get_object_or_404(
+                Pedido.objects.select_for_update(of=("self",)),
+                pk=pedido_id,
+                cuenta=cuenta,
+            )
             detalle = get_object_or_404(
                 DetallePedido.objects.select_for_update(of=("self",)),
                 pk=detalle_id,
-                pedido__cuenta=cuenta,
+                pedido=pedido,
             )
             solicitud = get_object_or_404(
                 SolicitudCancelacionDetalle.objects.select_for_update(
@@ -475,11 +519,28 @@ class PreparacionSectorMixin:
             PreparacionPedidoSector.objects.filter(
                 sector_id=self.request.user.sector_id,
             )
+            .annotate(
+                tiene_detalles_vigentes=detalles_vigentes_exist(),
+            )
+            .filter(tiene_detalles_vigentes=True)
             .select_related(
                 "pedido",
                 "pedido__mesa",
                 "sector",
             )
+            .prefetch_related(
+                Prefetch(
+                    "pedido__detalles",
+                    queryset=DetallePedido.objects.select_related(
+                        "producto",
+                        "sector_destino",
+                    ).prefetch_related(
+                        "solicitudes_cancelacion",
+                    ).order_by("pk"),
+                ),
+                "pedido__preparaciones_sectoriales__sector",
+            )
+            .order_by("pedido__fecha_creacion", "pk")
         )
 
 
@@ -503,8 +564,12 @@ class PreparacionPedidoSectorEstadoView(
 
         try:
             with transaction.atomic():
-                pedido = Pedido.objects.select_for_update().get(
+                cuenta = Cuenta.objects.select_for_update(of=("self",)).get(
+                    pk=preparacion_autorizada.pedido.cuenta_id,
+                )
+                pedido = Pedido.objects.select_for_update(of=("self",)).get(
                     pk=preparacion_autorizada.pedido_id,
+                    cuenta=cuenta,
                 )
                 preparacion = PreparacionPedidoSector.objects.select_for_update().select_related(
                     "sector",
@@ -512,23 +577,37 @@ class PreparacionPedidoSectorEstadoView(
                     pk=preparacion_autorizada.pk,
                     pedido=pedido,
                 )
+                if not detalles_vigentes_de_sector(
+                    pedido,
+                    preparacion.sector_id,
+                    lock=True,
+                ):
+                    raise DjangoValidationError(
+                        "La preparación no contiene productos vigentes."
+                    )
                 preparacion.transicionar_a(serializer.validated_data["estado"])
 
-                preparaciones = list(
-                    pedido.preparaciones_sectoriales.select_related("sector")
-                )
                 if (
-                    len(preparaciones) == 1
-                    and preparaciones[0].sector.nombre == Sector.Nombre.BARRA
-                    and preparaciones[0].estado
-                    == PreparacionPedidoSector.Estado.LISTO
+                    preparacion.sector.nombre == Sector.Nombre.BARRA
+                    and preparacion.estado == PreparacionPedidoSector.Estado.LISTO
                 ):
-                    pedido.habilitar_retiro(request.user)
+                    pedido.crear_aviso_retiro(
+                        AvisoRetiro.Origen.BARRA,
+                        request.user,
+                    )
         except DjangoValidationError as exc:
             raise serializers.ValidationError(
                 exc.message_dict if hasattr(exc, "message_dict") else exc.messages,
             ) from exc
 
+        prefetch_related_objects(
+            [preparacion],
+            "pedido__mesa",
+            "pedido__detalles__producto",
+            "pedido__detalles__sector_destino",
+            "pedido__detalles__solicitudes_cancelacion",
+            "pedido__preparaciones_sectoriales__sector",
+        )
         return Response(
             PreparacionPedidoSectorSerializer(
                 preparacion,
@@ -543,20 +622,34 @@ class ControlRetiroBarraListView(generics.ListAPIView):
 
     def get_queryset(self):
         return (
-            Pedido.objects.filter(
-                retiro_habilitado_en__isnull=True,
-                detalles__sector_destino__nombre__in={
-                    Sector.Nombre.PIZZA,
-                    Sector.Nombre.PLATOS,
-                },
+            Pedido.objects.annotate(
+                tiene_productos_cocina_vigentes=detalles_vigentes_exist(
+                    en_pedido="pk",
+                    en_sector=None,
+                    sectores={
+                        Sector.Nombre.PIZZA,
+                        Sector.Nombre.PLATOS,
+                    },
+                ),
             )
-            .distinct()
+            .filter(tiene_productos_cocina_vigentes=True)
+            .exclude(
+                avisos_retiro__origen=AvisoRetiro.Origen.COCINA,
+            )
             .select_related("mesa", "mozo")
             .prefetch_related(
-                "detalles__producto",
-                "detalles__sector_destino",
+                Prefetch(
+                    "detalles",
+                    queryset=DetallePedido.objects.select_related(
+                        "producto",
+                        "sector_destino",
+                    ).prefetch_related(
+                        "solicitudes_cancelacion",
+                    ).order_by("pk"),
+                ),
                 "preparaciones_sectoriales__sector",
             )
+            .order_by("fecha_creacion", "pk")
         )
 
 
@@ -567,19 +660,36 @@ class ConfirmarRetiroView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         try:
             with transaction.atomic():
+                pedido_referencia = get_object_or_404(
+                    Pedido.objects.select_related("cuenta"),
+                    pk=kwargs["pk"],
+                )
+                Cuenta.objects.select_for_update(of=("self",)).get(
+                    pk=pedido_referencia.cuenta_id,
+                )
                 pedido = get_object_or_404(
-                    Pedido.objects.select_for_update().select_related(
+                    Pedido.objects.select_for_update(of=("self",)).select_related(
                         "mesa",
                         "mozo",
                     ),
                     pk=kwargs["pk"],
                 )
-                pedido.habilitar_retiro(request.user)
+                pedido.crear_aviso_retiro(
+                    AvisoRetiro.Origen.COCINA,
+                    request.user,
+                )
         except DjangoValidationError as exc:
             raise serializers.ValidationError(
                 exc.message_dict if hasattr(exc, "message_dict") else exc.messages,
             ) from exc
 
+        prefetch_related_objects(
+            [pedido],
+            "detalles__producto",
+            "detalles__sector_destino",
+            "detalles__solicitudes_cancelacion",
+            "preparaciones_sectoriales__sector",
+        )
         return Response(
             ControlRetiroBarraSerializer(
                 pedido,
@@ -595,7 +705,25 @@ class AvisosRetiroListView(generics.ListAPIView):
     def get_queryset(self):
         return AvisoRetiro.objects.filter(
             destinatario=self.request.user,
-        ).select_related("pedido")
+        ).select_related("pedido").order_by("-fecha_creacion", "-pk")
+
+
+class MarcarAvisoRetiroLeidoView(generics.GenericAPIView):
+    permission_classes = [IsMozo]
+
+    def post(self, request, *args, **kwargs):
+        aviso = get_object_or_404(
+            AvisoRetiro.objects.filter(
+                destinatario=request.user,
+            ),
+            pk=kwargs["pk"],
+        )
+        actualizados = AvisoRetiro.objects.filter(
+            pk=aviso.pk,
+            destinatario=request.user,
+            leido_en__isnull=True,
+        ).update(leido_en=timezone.now())
+        return Response({"actualizados": actualizados})
 
 
 class MarcarAvisosRetiroLeidosView(generics.GenericAPIView):

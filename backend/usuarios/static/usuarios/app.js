@@ -7,6 +7,9 @@ const API = {
     me: "/api/usuarios/me/",
     mesas: "/api/pedidos/mesas/",
     cuentas: "/api/pedidos/cuentas/",
+    preparaciones: "/api/pedidos/preparacion/",
+    estadoPreparacion: (preparationId) =>
+        `/api/pedidos/preparacion/${preparationId}/estado/`,
     retirosBarra: "/api/pedidos/barra/retiros/",
     confirmarRetiroBarra: (pedidoId) =>
         `/api/pedidos/barra/retiros/${pedidoId}/confirmar/`,
@@ -22,7 +25,8 @@ const API = {
         "/api/pedidos/cancelaciones/notificaciones/leidas/",
     resolverCancelacion: (id) => `/api/pedidos/cancelaciones/${id}/resolver/`,
     avisosRetiro: "/api/pedidos/avisos/",
-    marcarAvisosRetiroLeidos: "/api/pedidos/avisos/leidos/",
+    marcarAvisoRetiroLeido: (noticeId) =>
+        `/api/pedidos/avisos/${noticeId}/leido/`,
 };
 
 const ZONES = [
@@ -58,15 +62,24 @@ let cancellationsViewGeneration = 0;
 let notificationRefreshPending = false;
 let notificationRefreshPromise = null;
 const accountConsumptionRequests = new Map();
+const inFlightGetRequests = new Map();
+let apiReadEpoch = 0;
 let accountConsumptionRefreshPromise = null;
 let accountConsumptionRefreshAccountId = null;
 let accountConsumptionStale = false;
+let operationalRefreshPromise = null;
+let operationalRefreshAgain = false;
+let operationalRefreshTimer = null;
+let barRetirementMessageTimer = null;
+let barPreparationMessageTimer = null;
 const uncertainOrderAccounts = new Set();
 const uncertainCancellationRequests = new Map();
 const uncertainCancellationResolutions = new Set();
 const resolvingCancellationRequests = new Set();
 const cancellationNotificationStates = new Map();
 const confirmingBarRetirements = new Set();
+const transitioningBarPreparations = new Set();
+const readingRetirementNotices = new Set();
 
 function uncertainOrdersStorageKey(userId) {
     return `restaurant:uncertain-order-mesas:${userId}`;
@@ -96,8 +109,10 @@ function restoreUncertainCancellationRequests(userId) {
                 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
                     .test(entry[1].clave_idempotencia)
                 || !isValidQuantity(String(entry[1].cantidad))
-                || typeof entry[1].motivo !== "string"
-                || !entry[1].motivo.trim()
+                || (
+                    entry[1].motivo !== undefined
+                    && typeof entry[1].motivo !== "string"
+                )
             ) {
                 throw new Error("El registro local de cancelaciones inciertas tiene datos inválidos.");
             }
@@ -213,32 +228,72 @@ async function fetchCsrfToken() {
     return csrfToken;
 }
 
-async function fetchApi(url, options = {}) {
+class StaleApiReadError extends Error {}
+
+function invalidateReadRequests() {
+    apiReadEpoch += 1;
+    inFlightGetRequests.clear();
+    accountConsumptionRequests.clear();
+}
+
+function fetchApi(url, options = {}) {
     const method = (options.method || "GET").toUpperCase();
-    const headers = { Accept: "application/json", ...(options.headers || {}) };
-    if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    if (!["GET", "HEAD", "OPTIONS", "TRACE"].includes(method)) {
-        headers["X-CSRFToken"] = await fetchCsrfToken();
+    const readOnly = ["GET", "HEAD"].includes(method);
+    const requestKey = `${method} ${url}`;
+    if (readOnly && inFlightGetRequests.has(requestKey)) {
+        return inFlightGetRequests.get(requestKey);
+    }
+    const requestEpoch = apiReadEpoch;
+
+    const request = (async () => {
+        const headers = { Accept: "application/json", ...(options.headers || {}) };
+        if (options.body !== undefined) headers["Content-Type"] = "application/json";
+        if (!["GET", "HEAD", "OPTIONS", "TRACE"].includes(method)) {
+            headers["X-CSRFToken"] = await fetchCsrfToken();
+        }
+
+        const response = await fetch(url, {
+            ...options,
+            method,
+            headers,
+            credentials: "same-origin",
+        });
+        const data = await readJson(response);
+        if (!response.ok) {
+            if (response.status === 401 || response.status === 403) {
+                await handleAuthenticationFailure();
+            }
+            const error = new Error(
+                formatApiError(data, "No se pudo completar la solicitud."),
+            );
+            error.status = response.status;
+            throw error;
+        }
+        if (readOnly && requestEpoch !== apiReadEpoch) {
+            throw new StaleApiReadError("La respuesta quedó desactualizada.");
+        }
+        return data;
+    })();
+    if (!readOnly) {
+        return request.then(
+            (data) => {
+                invalidateReadRequests();
+                return data;
+            },
+            (error) => {
+                invalidateReadRequests();
+                throw error;
+            },
+        );
     }
 
-    const response = await fetch(url, {
-        ...options,
-        method,
-        headers,
-        credentials: "same-origin",
-    });
-    const data = await readJson(response);
-    if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-            await handleAuthenticationFailure();
+    const trackedRequest = request.finally(() => {
+        if (inFlightGetRequests.get(requestKey) === trackedRequest) {
+            inFlightGetRequests.delete(requestKey);
         }
-        const error = new Error(
-            formatApiError(data, "No se pudo completar la solicitud."),
-        );
-        error.status = response.status;
-        throw error;
-    }
-    return data;
+    });
+    inFlightGetRequests.set(requestKey, trackedRequest);
+    return trackedRequest;
 }
 
 async function handleAuthenticationFailure() {
@@ -335,6 +390,41 @@ function makeElement(tag, className, text) {
     if (className) element.className = className;
     if (text !== undefined) element.textContent = text;
     return element;
+}
+
+function captureListView(container) {
+    const focused = container.contains(document.activeElement)
+        ? document.activeElement.closest(
+            "[data-preparation-id], [data-order-id], [data-request-id], [data-notice-id], [data-table-id]",
+        )
+        : null;
+    const focusAttribute = focused
+        ? [...focused.attributes].find((attribute) => attribute.name.startsWith("data-"))
+        : null;
+    return {
+        scrollTop: container.scrollTop,
+        windowScrollY: window.scrollY,
+        focusAttribute: focusAttribute && focusAttribute.name,
+        focusValue: focusAttribute && focusAttribute.value,
+        focusTagName: focused && focused.tagName,
+    };
+}
+
+function restoreListView(container, state) {
+    container.scrollTop = state.scrollTop;
+    if (window.scrollY !== state.windowScrollY) {
+        window.scrollTo(window.scrollX, state.windowScrollY);
+    }
+    if (!state.focusAttribute) return;
+    const candidates = [...container.querySelectorAll(
+        `[${state.focusAttribute}]`,
+    )].filter((element) => (
+        element.getAttribute(state.focusAttribute) === state.focusValue
+    ));
+    const replacement = candidates.find(
+        (element) => element.tagName === state.focusTagName,
+    ) || candidates[0];
+    if (replacement) replacement.focus();
 }
 
 function canLoadOrder(cuenta) {
@@ -790,7 +880,11 @@ async function refreshAccountConsumptionAfterCancellation(cuentaId) {
                 setAccountMessage("");
             }
             return true;
-        } catch {
+        } catch (error) {
+            if (error instanceof StaleApiReadError) {
+                accountConsumptionStale = true;
+                return false;
+            }
             if (
                 accountContext === contextAtStart
                 && accountViewGeneration === generation
@@ -835,13 +929,8 @@ function renderCancellationHistory(detail, row) {
             "",
             `${cancellationStatusLabel(solicitud.estado)} · ${solicitud.cantidad} u. · ${outcome}`,
         ));
-        item.append(makeElement("span", "", `Motivo: ${solicitud.motivo}`));
-        if (solicitud.resuelto_por_nombre) {
-            item.append(makeElement(
-                "span",
-                "",
-                `Resuelta por: ${solicitud.resuelto_por_nombre}`,
-            ));
+        if (solicitud.motivo) {
+            item.append(makeElement("span", "", `Motivo: ${solicitud.motivo}`));
         }
         row.append(item);
     }
@@ -849,6 +938,11 @@ function renderCancellationHistory(detail, row) {
 
 function renderAccountConsumption(consumption) {
     const container = document.getElementById("account-consumption");
+    const scrollTop = container.scrollTop;
+    const focusedButton = container.contains(document.activeElement)
+        ? document.activeElement.closest(".cancellation-request-open")
+        : null;
+    const focusedDetailId = focusedButton && focusedButton.dataset.detailId;
     container.replaceChildren();
     if (consumption.pedidos.length === 0) {
         container.append(makeElement("p", "summary-empty", "Sin consumos"));
@@ -876,6 +970,8 @@ function renderAccountConsumption(consumption) {
             order.append(orderHeading);
             for (const detalle of pedido.detalles) {
                 const row = makeElement("div", "consumption-item");
+                row.dataset.detailId = String(detalle.id);
+                row.tabIndex = -1;
                 const productInfo = makeElement("div", "consumption-product");
                 productInfo.append(makeElement(
                     "span",
@@ -886,6 +982,18 @@ function renderAccountConsumption(consumption) {
                     "span",
                     "consumption-item-price",
                     `${formatMoney(detalle.precio_unitario)} c/u`,
+                ));
+                const deliveryLabels = {
+                    PENDIENTE: "Pendiente",
+                    ENTREGADO: "Entregado",
+                    CANCELADO: "Cancelado",
+                };
+                productInfo.append(makeElement(
+                    "span",
+                    `consumption-delivery-status consumption-delivery-${(
+                        detalle.estado_entrega || "PENDIENTE"
+                    ).toLowerCase()}`,
+                    deliveryLabels[detalle.estado_entrega] || "Pendiente",
                 ));
                 row.append(productInfo);
                 row.append(makeElement(
@@ -915,7 +1023,10 @@ function renderAccountConsumption(consumption) {
                     ? uncertainCancellationRequests.get(operationKey)
                     : null;
                 if (canRequestCancellation(accountContext && accountContext.cuenta)
-                    && (uncertainOperation || detalle.cantidad_disponible_cancelacion > 0)) {
+                    && (
+                        uncertainOperation
+                        || detalle.puede_solicitar_cancelacion
+                    )) {
                     const cancelButton = makeElement(
                         "button",
                         "button button-quiet cancellation-request-open",
@@ -941,6 +1052,17 @@ function renderAccountConsumption(consumption) {
     const total = document.getElementById("account-total");
     total.textContent = `Total acumulado: ${formatMoney(consumption.total)}`;
     total.hidden = false;
+    container.scrollTop = scrollTop;
+    if (focusedDetailId) {
+        const replacement = [...container.querySelectorAll(
+            ".cancellation-request-open",
+        )].find((button) => button.dataset.detailId === focusedDetailId);
+        const focusedRow = [...container.querySelectorAll(
+            ".consumption-item",
+        )].find((row) => row.dataset.detailId === focusedDetailId);
+        if (replacement) replacement.focus();
+        else if (focusedRow) focusedRow.focus();
+    }
 }
 
 function updateAccountHeader() {
@@ -997,6 +1119,11 @@ async function loadAccountConsumption(
         return true;
     } catch (error) {
         if (!isCurrentAccountView(generation)) return false;
+        if (error instanceof StaleApiReadError) {
+            accountConsumptionStale = true;
+            document.getElementById("consumption-loading").hidden = true;
+            return false;
+        }
         showAccountError(failureMessage
             ? `${failureMessage} ${error.message || ""}`.trim()
             : error.message || "No se pudo consultar el consumo de la cuenta.");
@@ -1102,11 +1229,7 @@ function openCancellationForm(button) {
     document.getElementById("cancellation-quantity").value = isRetry
         ? String(pendingOperation.cantidad)
         : "";
-    document.getElementById("cancellation-reason").value = isRetry
-        ? pendingOperation.motivo
-        : "";
     document.getElementById("cancellation-quantity").disabled = isRetry;
-    document.getElementById("cancellation-reason").disabled = isRetry;
     document.getElementById("cancellation-submit").disabled = false;
     document.getElementById("cancellation-submit").textContent =
         isRetry ? "Reintentar solicitud" : "Solicitar cancelación";
@@ -1145,18 +1268,16 @@ async function submitCancellation(event) {
     event.preventDefault();
     if (!cancellationContext || cancellationPending) return;
     const quantity = document.getElementById("cancellation-quantity").value;
-    const reason = document.getElementById("cancellation-reason").value.trim();
     const quantityInput = document.getElementById("cancellation-quantity");
     if (
         !cancellationContext.retryOperation
         && (
             !isValidQuantity(quantity)
             || Number(quantity) > cancellationContext.available
-            || !reason
         )
     ) {
         showCancellationMessage(
-            "Ingresá una cantidad disponible y un motivo obligatorio.",
+            "Ingresá una cantidad disponible.",
             true,
         );
         return;
@@ -1183,7 +1304,6 @@ async function submitCancellation(event) {
         : {
             clave_idempotencia: context.claveIdempotencia,
             cantidad: Number(quantity),
-            motivo: reason,
         };
     if (!operation) {
         showCancellationMessage(
@@ -1212,7 +1332,6 @@ async function submitCancellation(event) {
     document.getElementById("cancellation-submit").disabled = true;
     document.getElementById("cancellation-submit").textContent = "Enviando…";
     quantityInput.disabled = true;
-    document.getElementById("cancellation-reason").disabled = true;
     try {
         await fetchApi(
             API.cancelacionesCuenta(context.cuentaId, context.detailId),
@@ -1241,6 +1360,7 @@ async function submitCancellation(event) {
         const confirmedRejection = Number.isInteger(error.status)
             && error.status >= 400
             && error.status < 500;
+        if (confirmedRejection) accountConsumptionStale = true;
         if (confirmedRejection && error.status !== 409) {
             uncertainCancellationRequests.delete(context.detailKey);
             persistUncertainCancellationRequests();
@@ -1258,7 +1378,6 @@ async function submitCancellation(event) {
                 return;
             }
             quantityInput.disabled = false;
-            document.getElementById("cancellation-reason").disabled = false;
             document.getElementById("cancellation-submit").disabled = false;
             document.getElementById("cancellation-submit").textContent =
                 "Solicitar cancelación";
@@ -1535,10 +1654,12 @@ async function submitOrder() {
 
 function renderTables(mesas, cuentas) {
     const container = document.getElementById("zones");
+    const viewState = captureListView(container);
     container.replaceChildren();
     if (mesas.length === 0) {
         container.append(makeElement("p", "empty-zone", "Todavía no hay mesas configuradas."));
         document.getElementById("loading-message").hidden = true;
+        restoreListView(container, viewState);
         return;
     }
     const accountsByTable = new Map(cuentas.map((cuenta) => [cuenta.mesa, cuenta]));
@@ -1575,13 +1696,16 @@ function renderTables(mesas, cuentas) {
         container.append(section);
     }
     document.getElementById("loading-message").hidden = true;
+    restoreListView(container, viewState);
 }
 
-async function loadTables() {
+async function loadTables(silent = false) {
     const loading = document.getElementById("loading-message");
-    loading.hidden = false;
-    loading.textContent = "Cargando mesas y cuentas…";
-    showMessage("");
+    if (!silent) {
+        loading.hidden = false;
+        loading.textContent = "Cargando mesas y cuentas…";
+        showMessage("");
+    }
     try {
         const [mesas, cuentas] = await Promise.all([
             fetchApi(API.mesas),
@@ -1590,21 +1714,195 @@ async function loadTables() {
         renderTables(mesas, cuentas);
         return { mesas, cuentas };
     } catch (error) {
-        loading.textContent = "No se pudieron cargar los datos.";
-        showMessage(error.message || "No se pudieron cargar mesas y cuentas.", true);
+        if (silent || error instanceof StaleApiReadError) {
+            loading.hidden = true;
+        }
+        if (!silent && !(error instanceof StaleApiReadError)) {
+            loading.textContent = "No se pudieron cargar los datos.";
+            showMessage(
+                error.message || "No se pudieron cargar mesas y cuentas.",
+                true,
+            );
+        }
         return null;
     }
 }
 
-function setBarRetirementMessage(text, isError = false) {
+function setBarRetirementMessage(text, isError = false, autoHideMs = 0) {
+    if (barRetirementMessageTimer !== null) {
+        window.clearTimeout(barRetirementMessageTimer);
+        barRetirementMessageTimer = null;
+    }
     const message = document.getElementById("bar-retirements-message");
     message.textContent = text;
     message.classList.toggle("message-error", isError);
     message.hidden = !text;
+    if (text && !isError && autoHideMs > 0) {
+        barRetirementMessageTimer = window.setTimeout(() => {
+            barRetirementMessageTimer = null;
+            setBarRetirementMessage("");
+        }, autoHideMs);
+    }
+}
+
+function setBarPreparationMessage(text, isError = false) {
+    if (barPreparationMessageTimer !== null) {
+        window.clearTimeout(barPreparationMessageTimer);
+        barPreparationMessageTimer = null;
+    }
+
+    const message = document.getElementById("bar-preparations-message");
+    message.textContent = text;
+    message.classList.toggle("message-error", isError);
+    message.hidden = !text;
+
+    if (text && !isError) {
+        barPreparationMessageTimer = window.setTimeout(() => {
+            barPreparationMessageTimer = null;
+            setBarPreparationMessage("");
+        }, 10000);
+    }
+}
+
+function renderBarPreparations(preparations) {
+    const container = document.getElementById("bar-preparations-list");
+    const viewState = captureListView(container);
+    const pendingPreparations = preparations.filter(
+        (preparation) => preparation.estado !== "LISTO",
+    );
+    container.replaceChildren();
+    if (!pendingPreparations.length) {
+        container.append(makeElement(
+            "p",
+            "summary-empty",
+            "No hay productos de Barra pendientes de preparación.",
+        ));
+        restoreListView(container, viewState);
+        return;
+    }
+
+    const zoneLabels = {
+        SALON: "Salón",
+        VEREDA_A: "Vereda A",
+        VEREDA_B: "Vereda B",
+    };
+    const stateLabels = {
+        PENDIENTE: "Pendiente",
+        EN_PREPARACION: "En preparación",
+        LISTO: "Listo",
+    };
+    for (const preparation of pendingPreparations) {
+        const card = makeElement("article", "cancellation-card");
+        card.dataset.preparationId = String(preparation.id);
+        const header = makeElement("header", "cancellation-card-header");
+        header.append(makeElement("h3", "", `Pedido #${preparation.pedido}`));
+        header.append(makeElement(
+            "span",
+            "cancellation-status bar-preparation-status",
+            stateLabels[preparation.estado] || preparation.estado,
+        ));
+        card.append(header);
+        card.append(makeElement(
+            "p",
+            "",
+            preparation.identificacion
+                || `${zoneLabels[preparation.zona] || preparation.zona} · Mesa ${preparation.mesa}`,
+        ));
+        card.append(makeElement("h4", "", "Productos de Barra"));
+        const products = makeElement("ul", "bar-retirement-products");
+        for (const detail of preparation.detalles || []) {
+            products.append(makeElement(
+                "li",
+                "",
+                `${detail.producto_nombre} · ${detail.cantidad} unidad(es)`,
+            ));
+        }
+        card.append(products);
+
+        if (preparation.estado !== "LISTO") {
+            const button = makeElement(
+                "button",
+                "button button-primary",
+                "Pedido listo",
+            );
+            button.type = "button";
+            button.dataset.preparationId = String(preparation.id);
+            button.disabled = transitioningBarPreparations.has(preparation.id);
+            card.append(button);
+        }
+        container.append(card);
+    }
+    restoreListView(container, viewState);
+}
+
+async function loadBarPreparations(successMessage = "", silent = false) {
+    const loading = document.getElementById("bar-preparations-loading");
+    if (!silent) {
+        loading.hidden = false;
+        setBarPreparationMessage("");
+    }
+    try {
+        const preparations = await fetchApi(API.preparaciones);
+        renderBarPreparations(preparations);
+        loading.hidden = true;
+        if (successMessage) setBarPreparationMessage(successMessage);
+        return true;
+    } catch (error) {
+        loading.hidden = true;
+        if (!silent && !(error instanceof StaleApiReadError)) {
+            setBarPreparationMessage(
+                error.message || "No se pudieron consultar las preparaciones de Barra.",
+                true,
+            );
+        }
+        return false;
+    }
+}
+
+async function transitionBarPreparation(button) {
+    const preparationId = Number(button.dataset.preparationId);
+    if (
+        !Number.isSafeInteger(preparationId)
+        || preparationId < 1
+        || button.disabled
+        || transitioningBarPreparations.has(preparationId)
+    ) return;
+
+    transitioningBarPreparations.add(preparationId);
+    button.disabled = true;
+    try {
+        await fetchApi(API.estadoPreparacion(preparationId), {
+            method: "PATCH",
+            body: JSON.stringify({ estado: "LISTO" }),
+        });
+        transitioningBarPreparations.delete(preparationId);
+        const [preparationsUpdated, retirementsUpdated] = await Promise.all([
+            loadBarPreparations("Estado de preparación actualizado."),
+            loadBarRetirements(),
+        ]);
+        if (!preparationsUpdated || !retirementsUpdated) {
+            if (!preparationsUpdated && button.isConnected) {
+                button.disabled = false;
+            }
+            showMessage(
+                "Pedido marcado listo, pero no se pudo actualizar toda la pantalla. "
+                    + "Actualizá los datos para consultar el estado actual.",
+                true,
+            );
+        }
+    } catch (error) {
+        transitioningBarPreparations.delete(preparationId);
+        if (button.isConnected) button.disabled = false;
+        setBarPreparationMessage(
+            error.message || "No se pudo actualizar la preparación.",
+            true,
+        );
+    }
 }
 
 function renderBarRetirements(requests) {
     const container = document.getElementById("bar-retirements-list");
+    const viewState = captureListView(container);
     container.replaceChildren();
     if (!requests.length) {
         container.append(makeElement(
@@ -1612,12 +1910,14 @@ function renderBarRetirements(requests) {
             "summary-empty",
             "No hay pedidos pendientes de Cocina.",
         ));
+        restoreListView(container, viewState);
         return;
     }
 
     const sectorLabels = { PIZZA: "Pizza", PLATOS: "Platos" };
     for (const request of requests) {
         const card = makeElement("article", "cancellation-card");
+        card.dataset.orderId = String(request.pedido);
         const header = makeElement("header", "cancellation-card-header");
         header.append(makeElement("h3", "", `Pedido #${request.pedido}`));
         card.append(header);
@@ -1643,43 +1943,43 @@ function renderBarRetirements(requests) {
         );
         button.type = "button";
         button.dataset.orderId = String(request.pedido);
-        button.disabled = (
-            !request.puede_habilitar_retiro
-            || confirmingBarRetirements.has(request.pedido)
-        );
+        button.disabled = confirmingBarRetirements.has(request.pedido);
         card.append(button);
-
-        const barraPreparation = (request.estados_sectores || []).find(
-            (preparation) => preparation.sector === "BARRA",
-        );
-        if (barraPreparation && barraPreparation.estado !== "LISTO") {
-            card.append(makeElement(
-                "p",
-                "",
-                "Los productos de Barra deben estar listos antes de avisar al mozo.",
-            ));
-        }
         container.append(card);
     }
+    restoreListView(container, viewState);
 }
 
-async function loadBarRetirements(successMessage = "") {
+async function loadBarRetirements(
+    successMessage = "",
+    silent = false,
+    successMessageLifetimeMs = 0,
+) {
     const loading = document.getElementById("bar-retirements-loading");
-    loading.hidden = false;
-    setBarRetirementMessage("");
-    document.getElementById("bar-retirements-list").replaceChildren();
+    if (!silent) {
+        loading.hidden = false;
+        setBarRetirementMessage("");
+    }
     try {
         const requests = await fetchApi(API.retirosBarra);
         renderBarRetirements(requests);
         loading.hidden = true;
-        if (successMessage) setBarRetirementMessage(successMessage);
+        if (successMessage) {
+            setBarRetirementMessage(
+                successMessage,
+                false,
+                successMessageLifetimeMs,
+            );
+        }
         return true;
     } catch (error) {
         loading.hidden = true;
-        setBarRetirementMessage(
-            error.message || "No se pudieron consultar los retiros pendientes.",
-            true,
-        );
+        if (!silent && !(error instanceof StaleApiReadError)) {
+            setBarRetirementMessage(
+                error.message || "No se pudieron consultar los retiros pendientes.",
+                true,
+            );
+        }
         return false;
     }
 }
@@ -1697,13 +1997,30 @@ async function confirmBarRetirement(button) {
     button.disabled = true;
     try {
         await fetchApi(API.confirmarRetiroBarra(pedidoId), { method: "POST" });
-        await loadBarRetirements("Retiro confirmado y mozo notificado.");
+        const [retirementsUpdated, preparationsUpdated] = await Promise.all([
+            loadBarRetirements(
+                "Recepción de Cocina confirmada y mozo notificado.",
+                false,
+                10000,
+            ),
+            loadBarPreparations(),
+        ]);
+        if (!retirementsUpdated || !preparationsUpdated) {
+            setBarRetirementMessage(
+                "Cocina confirmada, pero no se pudo actualizar toda la pantalla. "
+                    + "Actualizá los datos para consultar el estado.",
+                true,
+            );
+            if (!retirementsUpdated && button.isConnected) {
+                button.disabled = false;
+            }
+        }
     } catch (error) {
-        await loadBarRetirements();
         setBarRetirementMessage(
             error.message || "No se pudo confirmar el retiro.",
             true,
         );
+        if (button.isConnected) button.disabled = false;
     } finally {
         confirmingBarRetirements.delete(pedidoId);
     }
@@ -1716,6 +2033,7 @@ function isCurrentCancellationList(generation) {
 
 function renderCancellationRequests(requests) {
     const container = document.getElementById("cancellation-list");
+    const viewState = captureListView(container);
     container.replaceChildren();
     if (!requests.length) {
         container.append(makeElement(
@@ -1723,11 +2041,13 @@ function renderCancellationRequests(requests) {
             "summary-empty",
             "No hay solicitudes pendientes.",
         ));
+        restoreListView(container, viewState);
         return;
     }
 
     for (const request of requests) {
         const card = makeElement("article", "cancellation-card");
+        card.dataset.requestId = String(request.id);
         const header = makeElement("header", "cancellation-card-header");
         header.append(makeElement("h2", "", request.producto_nombre));
         header.append(makeElement(
@@ -1754,7 +2074,9 @@ function renderCancellationRequests(requests) {
             "",
             `${request.cantidad} unidad(es) · Solicita ${request.solicitante_nombre}`,
         ));
-        card.append(makeElement("p", "", `Motivo: ${request.motivo}`));
+        if (request.motivo) {
+            card.append(makeElement("p", "", `Motivo: ${request.motivo}`));
+        }
         if (canReviewCancellationRequests()) {
             const actions = makeElement("div", "cancellation-review-actions");
             const button = makeElement("button", "button button-primary", "Aceptar");
@@ -1771,15 +2093,17 @@ function renderCancellationRequests(requests) {
         }
         container.append(card);
     }
+    restoreListView(container, viewState);
 }
 
-async function loadCancellationRequests(successMessage = "") {
+async function loadCancellationRequests(successMessage = "", silent = false) {
     const generation = ++cancellationsViewGeneration;
     const loading = document.getElementById("cancellations-loading");
-    loading.hidden = false;
-    loading.textContent = "Cargando solicitudes…";
-    document.getElementById("cancellation-list").replaceChildren();
-    showMessage("");
+    if (!silent) {
+        loading.hidden = false;
+        loading.textContent = "Cargando solicitudes…";
+        showMessage("");
+    }
     try {
         const requests = await fetchApi(API.cancelacionesPendientes);
         if (!isCurrentCancellationList(generation)) return;
@@ -1796,14 +2120,16 @@ async function loadCancellationRequests(successMessage = "") {
     } catch (error) {
         if (!isCurrentCancellationList(generation)) return;
         loading.hidden = true;
-        showMessage(
-            successMessage
-                ? `${successMessage} La lista no se pudo actualizar. ${
-                    error.message || ""
-                }`.trim()
-                : error.message || "No se pudieron consultar las solicitudes.",
-            true,
-        );
+        if (!silent && !(error instanceof StaleApiReadError)) {
+            showMessage(
+                successMessage
+                    ? `${successMessage} La lista no se pudo actualizar. ${
+                        error.message || ""
+                    }`.trim()
+                    : error.message || "No se pudieron consultar las solicitudes.",
+                true,
+            );
+        }
         return false;
     }
 }
@@ -1848,19 +2174,19 @@ async function resolveCancellation(button) {
     resolvingCancellationRequests.delete(requestId);
     if (postFailed) {
         uncertainCancellationResolutions.add(requestId);
-        const notificationsFetched = await refreshCancellationNotifications(
+        const refreshedOperationalData = await refreshOperationalData(
             true,
             accountId,
         );
         const stateVerified = (
-            notificationsFetched
+            refreshedOperationalData
             && !uncertainCancellationResolutions.has(requestId)
         );
         if (document.body.dataset.page === "cancelaciones") {
             await loadCancellationRequests();
         }
         showNotificationError(
-            stateVerified
+            stateVerified && refreshedOperationalData
                 ? "No se pudo confirmar la aceptación. Se verificó el estado de la solicitud. "
                     + (postError.message || "")
                 : notificationsFetched
@@ -1873,19 +2199,13 @@ async function resolveCancellation(button) {
         return;
     }
 
-    const isCancellationPage =
-        document.body.dataset.page === "cancelaciones";
-    let cancellationListUpdated = true;
-    if (isCancellationPage) {
-        cancellationListUpdated = Boolean(
-            await loadCancellationRequests("Solicitud aceptada."),
-        );
-    }
-    const notificationsUpdated = await refreshCancellationNotifications(
+    const isCancellationPage = document.body.dataset.page === "cancelaciones";
+    const operationalDataUpdated = await refreshOperationalData(
         true,
         accountId,
+        isCancellationPage ? "Solicitud aceptada." : "",
     );
-    if (!cancellationListUpdated || !notificationsUpdated) {
+    if (!operationalDataUpdated) {
         showNotificationError(
             "Solicitud aceptada, pero no se pudo actualizar toda la información. "
                 + "Actualizá la vista para consultar el estado actual.",
@@ -1949,11 +2269,7 @@ function notificationStatusText(request) {
 function renderCancellationNotifications(requests, retirementNotices = []) {
     const list = document.getElementById("notification-list");
     const count = document.getElementById("notification-count");
-    const activeButton = document.activeElement
-        && document.activeElement.closest("button[data-request-id]");
-    const focusedRequestId = activeButton && list.contains(activeButton)
-        ? activeButton.dataset.requestId
-        : null;
+    const viewState = captureListView(list);
     list.replaceChildren();
     if (!requests.length && !retirementNotices.length) {
         list.append(makeElement(
@@ -1990,12 +2306,37 @@ function renderCancellationNotifications(requests, retirementNotices = []) {
                 "article",
                 `notification-item${notice.leido ? "" : " notification-item-not-read"}`,
             );
-            item.append(makeElement("p", "", notice.mensaje));
+            item.dataset.noticeId = String(notice.id);
+            item.append(makeElement(
+                "p",
+                "",
+                notice.mensaje,
+            ));
+            item.append(makeElement(
+                "span",
+                "notification-status",
+                notice.origen === "BARRA"
+                    ? "Barra"
+                    : notice.origen === "COCINA"
+                        ? "Cocina"
+                        : "Origen no identificado",
+            ));
             item.append(makeElement(
                 "span",
                 "notification-status",
                 notice.leido ? "Leída" : "Nueva",
             ));
+            if (!notice.leido) {
+                const button = makeElement(
+                    "button",
+                    "button button-secondary",
+                    "Marcar leída",
+                );
+                button.type = "button";
+                button.dataset.noticeId = String(notice.id);
+                button.disabled = readingRetirementNotices.has(notice.id);
+                item.append(button);
+            }
             list.append(item);
             continue;
         }
@@ -2005,6 +2346,8 @@ function renderCancellationNotifications(requests, retirementNotices = []) {
             "article",
             `notification-item${request.leido ? "" : " notification-item-not-read"}`,
         );
+        item.dataset.requestId = String(request.id);
+        item.append(makeElement("strong", "", "Solicitud de cancelación"));
         const heading = makeElement("div", "notification-item-heading");
         heading.append(makeElement("strong", "", request.producto_nombre));
         heading.append(makeElement(
@@ -2021,14 +2364,16 @@ function renderCancellationNotifications(requests, retirementNotices = []) {
         item.append(makeElement(
             "p",
             "",
-            `${request.cantidad} unidad(es) · ${request.zona} · Mesa ${request.mesa_numero}`,
+            `${request.cantidad} unidad(es) · Zona ${request.zona} · Mesa ${request.mesa_numero}`,
         ));
         item.append(makeElement(
             "p",
             "",
-            `${request.solicitante_nombre} · ${notificationDateLabel(request.fecha_solicitud)}`,
+            `Mozo: ${request.solicitante_nombre} · ${notificationDateLabel(request.fecha_solicitud)}`,
         ));
-        item.append(makeElement("p", "", `Motivo: ${request.motivo}`));
+        if (request.motivo) {
+            item.append(makeElement("p", "", `Motivo: ${request.motivo}`));
+        }
         if (
             canReviewCancellationRequests()
             && request.estado === "PENDIENTE"
@@ -2047,16 +2392,14 @@ function renderCancellationNotifications(requests, retirementNotices = []) {
         list.append(item);
     }
 
-    if (focusedRequestId) {
-        const replacement = [...list.querySelectorAll("button[data-request-id]")]
-            .find((button) => button.dataset.requestId === focusedRequestId);
-        if (replacement) replacement.focus();
-    }
+    restoreListView(list, viewState);
 }
 
 async function refreshCancellationNotifications(
     force = false,
     forceAccountId = null,
+    markAsRead = false,
+    silent = false,
 ) {
     if (
         document.visibilityState !== "visible"
@@ -2067,7 +2410,12 @@ async function refreshCancellationNotifications(
         const currentRefresh = notificationRefreshPromise;
         if (currentRefresh) await currentRefresh;
         if (force) {
-            return refreshCancellationNotifications(true, forceAccountId);
+            return refreshCancellationNotifications(
+                true,
+                forceAccountId,
+                markAsRead,
+                silent,
+            );
         }
         return true;
     }
@@ -2079,26 +2427,14 @@ async function refreshCancellationNotifications(
             let retirementNotices = currentUser.rol === "MOZO"
                 ? await fetchApi(API.avisosRetiro)
                 : [];
-            const panel = document.getElementById("notification-panel");
-            const panelAbierto = panel && !panel.hidden;
             if (
-                panelAbierto
+                markAsRead
                 && requests.some((request) => !request.leido)
             ) {
                 await fetchApi(API.marcarCancelacionesLeidas, {
                     method: "POST",
                 });
                 requests = await fetchApi(API.notificacionesCancelacion);
-            }
-            if (
-                currentUser.rol === "MOZO"
-                && panelAbierto
-                && retirementNotices.some((notice) => !notice.leido)
-            ) {
-                await fetchApi(API.marcarAvisosRetiroLeidos, {
-                    method: "POST",
-                });
-                retirementNotices = await fetchApi(API.avisosRetiro);
             }
             const changedAccountIds = new Set();
             for (const request of requests) {
@@ -2152,11 +2488,13 @@ async function refreshCancellationNotifications(
             if (Number.isSafeInteger(forceAccountId) && forceAccountId > 0) {
                 await refreshAccountConsumptionAfterCancellation(forceAccountId);
             }
-            showNotificationError(
-                `No se pudieron actualizar las notificaciones. ${
-                    error.message || ""
-                }`.trim(),
-            );
+            if (!silent) {
+                showNotificationError(
+                    `No se pudieron actualizar las notificaciones. ${
+                        error.message || ""
+                    }`.trim(),
+                );
+            }
             return false;
         } finally {
             notificationRefreshPending = false;
@@ -2164,6 +2502,129 @@ async function refreshCancellationNotifications(
         }
     })();
     return notificationRefreshPromise;
+}
+
+async function markRetirementNoticeRead(button) {
+    const noticeId = Number(button.dataset.noticeId);
+    if (
+        !Number.isSafeInteger(noticeId)
+        || noticeId < 1
+        || button.disabled
+        || readingRetirementNotices.has(noticeId)
+    ) return;
+
+    readingRetirementNotices.add(noticeId);
+    button.disabled = true;
+    try {
+        await fetchApi(API.marcarAvisoRetiroLeido(noticeId), {
+            method: "POST",
+        });
+        const updated = await refreshCancellationNotifications(true);
+        if (!updated) {
+            showNotificationError(
+                "Aviso marcado como leído, pero no se pudo actualizar el panel.",
+            );
+        }
+    } catch (error) {
+        showNotificationError(
+            `No se pudo marcar el aviso como leído. ${error.message || ""}`.trim(),
+        );
+        if (button.isConnected) button.disabled = false;
+    } finally {
+        readingRetirementNotices.delete(noticeId);
+    }
+}
+
+function refreshOperationalData(immediate = false, forceAccountId = null, successMessage = "") {
+    if (
+        document.visibilityState !== "visible"
+        || !currentUser
+    ) return Promise.resolve(false);
+
+    if (operationalRefreshPromise) {
+        if (immediate) operationalRefreshAgain = true;
+        return operationalRefreshPromise;
+    }
+
+    const request = (async () => {
+        let allUpdated = true;
+        try {
+            do {
+                operationalRefreshAgain = false;
+                const tasks = [];
+                const page = document.body.dataset.page;
+                if (page === "mesas") {
+                    tasks.push(loadTables(true));
+                    if (currentUser.rol === "BARRA") {
+                        tasks.push(loadBarPreparations("", true));
+                        tasks.push(loadBarRetirements("", true));
+                    }
+                    const accountOverlay = document.getElementById(
+                        "account-overlay",
+                    );
+                    if (
+                        accountOverlay
+                        && !accountOverlay.hidden
+                        && document.getElementById("order-overlay").hidden
+                        && document.getElementById("cancellation-overlay").hidden
+                        && accountContext
+                        && accountContext.cuenta
+                        && canViewCurrentAccountConsumption(accountContext.cuenta)
+                    ) {
+                        tasks.push(
+                            refreshAccountConsumptionAfterCancellation(
+                                accountContext.cuenta.id,
+                            ),
+                        );
+                    }
+                } else if (
+                    page === "cancelaciones"
+                    && currentUser.rol === "BARRA"
+                ) {
+                    tasks.push(loadCancellationRequests(successMessage, true));
+                }
+                if (["MOZO", "BARRA"].includes(currentUser.rol)) {
+                    tasks.push(
+                        refreshCancellationNotifications(
+                            false,
+                            forceAccountId,
+                            false,
+                            true,
+                        ),
+                    );
+                }
+                const results = await Promise.all(tasks);
+                allUpdated = results.every((result) => (
+                    result !== false && result !== null
+                ));
+                successMessage = "";
+                forceAccountId = null;
+            } while (
+                operationalRefreshAgain
+                && document.visibilityState === "visible"
+            );
+            return allUpdated;
+        } finally {
+            if (operationalRefreshPromise === request) {
+                operationalRefreshPromise = null;
+            }
+        }
+    })();
+    operationalRefreshPromise = request;
+    return request;
+}
+
+function startOperationalRefresh() {
+    if (operationalRefreshTimer !== null) return;
+    operationalRefreshTimer = window.setInterval(
+        () => refreshOperationalData(),
+        5000,
+    );
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            refreshOperationalData(true);
+        }
+    });
 }
 
 function initializeCancellationNotifications() {
@@ -2183,25 +2644,30 @@ function initializeCancellationNotifications() {
         panel.inert = false;
         panel.hidden = false;
         bell.setAttribute("aria-expanded", "true");
-        refreshCancellationNotifications(true);
-    });
-    document.getElementById("notification-close").addEventListener("click", () => {
-        closeNotificationPanel();
+        refreshCancellationNotifications(true, null, true);
     });
     panel.addEventListener("click", (event) => {
         const button = event.target.closest("button[data-request-id]");
         if (button) resolveCancellation(button);
+        const noticeButton = event.target.closest("button[data-notice-id]");
+        if (noticeButton) markRetirementNoticeRead(noticeButton);
     });
-    refreshCancellationNotifications();
-    window.setInterval(
-        refreshCancellationNotifications,
-        5000,
-    );
-    document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") {
-            refreshCancellationNotifications(true);
+    document.addEventListener("click", (event) => {
+        if (panel.hidden) return;
+        const target = event.target;
+        if (
+            !(target instanceof Node)
+            || panel.contains(target)
+            || bell.contains(target)
+        ) return;
+        closeNotificationPanel();
+    });
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !panel.hidden) {
+            closeNotificationPanel();
         }
     });
+    refreshCancellationNotifications();
 }
 
 function closeNotificationPanel() {
@@ -2231,14 +2697,19 @@ async function initializeOperationalPage() {
     initializeCancellationNotifications();
 
     if (document.body.dataset.page === "mesas") {
-        document.getElementById("cancellation-nav").hidden =
-            user.rol !== "BARRA";
         const barRetirements = document.getElementById("bar-retirements");
         barRetirements.hidden = user.rol !== "BARRA";
+        const barPreparations = document.getElementById("bar-preparations");
+        barPreparations.hidden = user.rol !== "BARRA";
         if (user.rol === "BARRA") {
-            document.getElementById("bar-retirements-refresh").addEventListener(
+            document.getElementById("bar-preparations-list").addEventListener(
                 "click",
-                () => loadBarRetirements(),
+                (event) => {
+                    const button = event.target.closest(
+                        "button[data-preparation-id]",
+                    );
+                    if (button) transitionBarPreparation(button);
+                },
             );
             document.getElementById("bar-retirements-list").addEventListener(
                 "click",
@@ -2249,16 +2720,18 @@ async function initializeOperationalPage() {
             );
         }
         initializeOrderForm();
-        document.getElementById("refresh-button").addEventListener("click", loadTables);
+
         await loadTables();
-        if (user.rol === "BARRA") await loadBarRetirements();
+        if (user.rol === "BARRA") {
+            await Promise.all([loadBarPreparations(), loadBarRetirements()]);
+        }
     }
     if (document.body.dataset.page === "cancelaciones") {
         const tablesNav = document.getElementById("tables-nav");
         tablesNav.hidden = user.rol !== "BARRA";
         document.getElementById("cancellations-refresh").addEventListener(
             "click",
-            loadCancellationRequests,
+            () => refreshOperationalData(true),
         );
         document.getElementById("cancellation-list").addEventListener(
             "click",
@@ -2269,6 +2742,7 @@ async function initializeOperationalPage() {
         );
         await loadCancellationRequests();
     }
+    startOperationalRefresh();
     if (uncertainRestoreError) showMessage(uncertainRestoreError, true);
     if (cancellationRestoreError) showMessage(cancellationRestoreError, true);
 }
