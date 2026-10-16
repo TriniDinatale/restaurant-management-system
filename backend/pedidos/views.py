@@ -1,4 +1,6 @@
 
+from decimal import Decimal
+
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Exists, OuterRef, Q, Sum, prefetch_related_objects
@@ -17,8 +19,10 @@ from usuarios.permissions import IsAdministrador, IsBarra, IsMozo, IsPreparador
 from .models import (
     AvisoCargaBarra,
     AvisoRetiro,
+    CobroCuenta,
     Cuenta,
     DetallePedido,
+    ImportePagoCuenta,
     LecturaNotificacionCancelacion,
     Mesa,
     Pedido,
@@ -30,6 +34,8 @@ from .serializers import (
     AvisoRetiroSerializer,
     ControlRetiroBarraSerializer,
     CuentaConsumoSerializer,
+    CobroCuentaCreateSerializer,
+    CobroCuentaSerializer,
     CuentaSerializer,
     RegistroCargaBarraSerializer,
     MesaSerializer,
@@ -48,6 +54,7 @@ from .services import (
     detalles_vigentes_exist,
     detalles_vigentes_de_sector,
     estado_entrega,
+    total_vigente_cuenta,
 )
 
 
@@ -88,6 +95,11 @@ class IdempotencyKeyConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_detail = "La clave de idempotencia ya fue usada con otros datos."
     default_code = "idempotency_key_conflict"
+
+
+class CuentaCobroConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "cuenta_cobro_conflict"
 
 
 class PedidoCreateView(generics.CreateAPIView):
@@ -155,6 +167,150 @@ class CuentaConsumoView(generics.RetrieveAPIView):
         return cuenta
 
 
+class CobrarCuentaView(generics.GenericAPIView):
+    permission_classes = [IsMozo]
+    serializer_class = CobroCuentaCreateSerializer
+
+    def obtener_existente(self, datos):
+        cobro = (
+            CobroCuenta.objects.select_related("cuenta", "mozo")
+            .prefetch_related("importes")
+            .filter(clave_idempotencia=datos["clave_idempotencia"])
+            .first()
+        )
+        if cobro is None:
+            return None
+        if cobro.mozo_id != self.request.user.pk:
+            self.permission_denied(self.request)
+        importes_guardados = {
+            importe.medio: importe.importe for importe in cobro.importes.all()
+        }
+        importes_enviados = {
+            item["medio"]: item["importe"] for item in datos["importes"]
+        }
+        if (
+            cobro.cuenta_id != self.kwargs["pk"]
+            or cobro.total_esperado != datos["total_esperado"]
+            or importes_guardados != importes_enviados
+        ):
+            raise IdempotencyKeyConflict()
+        return Response(
+            CobroCuentaSerializer(cobro).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        datos = serializer.validated_data
+
+        existente = self.obtener_existente(datos)
+        if existente is not None:
+            return existente
+
+        try:
+            with transaction.atomic():
+                mesa_id = (
+                    Cuenta.objects.filter(pk=kwargs["pk"])
+                    .values_list("mesa_id", flat=True)
+                    .first()
+                )
+                if mesa_id is None:
+                    raise Http404
+                get_object_or_404(
+                    Mesa.objects.select_for_update(),
+                    pk=mesa_id,
+                )
+                existente = self.obtener_existente(datos)
+                if existente is not None:
+                    return existente
+                cuenta = get_object_or_404(
+                    Cuenta.objects.select_for_update(of=("self",)).select_related(
+                        "mozo_responsable",
+                    ),
+                    pk=kwargs["pk"],
+                    estado=Cuenta.Estado.ABIERTA,
+                )
+                if cuenta.mozo_responsable_id is None:
+                    raise serializers.ValidationError(
+                        {
+                            "cuenta": (
+                                "La cuenta histórica no tiene responsable; "
+                                "debe resolverse administrativamente antes del cobro."
+                            )
+                        }
+                    )
+                if cuenta.mozo_responsable_id != request.user.pk:
+                    self.permission_denied(request)
+
+                existente = self.obtener_existente(datos)
+                if existente is not None:
+                    return existente
+
+                if SolicitudCancelacionDetalle.objects.filter(
+                    detalle__pedido__cuenta=cuenta,
+                    estado=SolicitudCancelacionDetalle.Estado.PENDIENTE,
+                ).exists():
+                    raise CuentaCobroConflict(
+                        "No se puede cerrar la cuenta mientras haya "
+                        "solicitudes de cancelación pendientes."
+                    )
+
+                total_actual = total_vigente_cuenta(cuenta)
+                if datos["total_esperado"] != total_actual:
+                    raise CuentaCobroConflict(
+                        "El total de la cuenta cambió. Revisá el nuevo total "
+                        "antes de volver a cobrar."
+                    )
+                total_pagado = sum(
+                    (item["importe"] for item in datos["importes"]),
+                    start=Decimal("0.00"),
+                )
+                if total_pagado != total_actual:
+                    raise serializers.ValidationError(
+                        {
+                            "importes": (
+                                "La suma de los pagos debe coincidir exactamente "
+                                "con el total vigente de la cuenta."
+                            )
+                        }
+                    )
+
+                cobro = CobroCuenta.objects.create(
+                    cuenta=cuenta,
+                    mozo=request.user,
+                    total_cobrado=total_actual,
+                    total_esperado=datos["total_esperado"],
+                    clave_idempotencia=datos["clave_idempotencia"],
+                )
+                ImportePagoCuenta.objects.bulk_create(
+                    [
+                        ImportePagoCuenta(
+                            cobro=cobro,
+                            medio=item["medio"],
+                            importe=item["importe"],
+                        )
+                        for item in datos["importes"]
+                    ]
+                )
+                cuenta.cerrar()
+                cobro = CobroCuenta.objects.select_related(
+                    "cuenta",
+                    "mozo",
+                ).prefetch_related("importes").get(pk=cobro.pk)
+                datos_respuesta = CobroCuentaSerializer(cobro).data
+        except IntegrityError:
+            existente = self.obtener_existente(datos)
+            if existente is not None:
+                return existente
+            raise
+
+        return Response(
+            datos_respuesta,
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class SolicitudCancelacionCreateView(generics.GenericAPIView):
     permission_classes = [IsMozo]
     serializer_class = SolicitudCancelacionCreateSerializer
@@ -204,6 +360,14 @@ class SolicitudCancelacionCreateView(generics.GenericAPIView):
             return existente
 
         with transaction.atomic():
+            mesa_id = (
+                Cuenta.objects.filter(pk=kwargs["cuenta_id"])
+                .values_list("mesa_id", flat=True)
+                .first()
+            )
+            if mesa_id is None:
+                raise Http404
+            get_object_or_404(Mesa.objects.select_for_update(), pk=mesa_id)
             cuenta = get_object_or_404(
                 Cuenta.objects.select_for_update(of=("self",)),
                 pk=kwargs["cuenta_id"],
@@ -381,13 +545,15 @@ class ResolverSolicitudCancelacionView(generics.GenericAPIView):
         solicitud_id = kwargs["pk"]
         solicitud_referencia = get_object_or_404(
             SolicitudCancelacionDetalle.objects.select_related(
-                "detalle__pedido",
+                "detalle__pedido__cuenta",
             ),
             pk=solicitud_id,
         )
         cuenta_id = solicitud_referencia.detalle.pedido.cuenta_id
+        mesa_id = solicitud_referencia.detalle.pedido.cuenta.mesa_id
 
         with transaction.atomic():
+            get_object_or_404(Mesa.objects.select_for_update(), pk=mesa_id)
             cuenta = get_object_or_404(
                 Cuenta.objects.select_for_update(of=("self",)),
                 pk=cuenta_id,

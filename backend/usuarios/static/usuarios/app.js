@@ -17,6 +17,7 @@ const API = {
     pedidosPorMesa: "/api/pedidos/mesas/cargas/",
     cargasBarra: "/api/pedidos/barra/cargas/",
     consumoCuenta: (cuentaId) => `/api/pedidos/cuentas/${cuentaId}/consumo/`,
+    cobrarCuenta: (cuentaId) => `/api/pedidos/cuentas/${cuentaId}/cobrar/`,
     cancelacionesCuenta: (cuentaId, detalleId) =>
         `/api/pedidos/cuentas/${cuentaId}/detalles/${detalleId}/cancelaciones/`,
     cancelacionesPendientes: "/api/pedidos/cancelaciones/pendientes/",
@@ -67,6 +68,8 @@ let apiReadEpoch = 0;
 let accountConsumptionRefreshPromise = null;
 let accountConsumptionRefreshAccountId = null;
 let accountConsumptionStale = false;
+let accountTotalCents = null;
+let accountPaymentPending = false;
 let operationalRefreshPromise = null;
 let operationalRefreshAgain = false;
 let operationalRefreshTimer = null;
@@ -74,6 +77,8 @@ let barRetirementMessageTimer = null;
 let barPreparationMessageTimer = null;
 const uncertainOrderAccounts = new Set();
 const uncertainCancellationRequests = new Map();
+const uncertainAccountPayments = new Map();
+const recentlyClosedAccountIds = new Set();
 const uncertainCancellationResolutions = new Set();
 const resolvingCancellationRequests = new Set();
 const cancellationNotificationStates = new Map();
@@ -87,6 +92,70 @@ function uncertainOrdersStorageKey(userId) {
 
 function uncertainCancellationsStorageKey(userId) {
     return `restaurant:uncertain-cancellations:${userId}`;
+}
+
+function uncertainPaymentsStorageKey(userId) {
+    return `restaurant:uncertain-account-payments:${userId}`;
+}
+
+function restoreUncertainAccountPayments(userId) {
+    uncertainAccountPayments.clear();
+    try {
+        const saved = JSON.parse(
+            sessionStorage.getItem(uncertainPaymentsStorageKey(userId)) || "[]",
+        );
+        if (!Array.isArray(saved)) {
+            throw new Error("El registro local de cobros inciertos tiene un formato inválido.");
+        }
+        for (const entry of saved) {
+            if (
+                !Array.isArray(entry)
+                || entry.length !== 2
+                || !Number.isSafeInteger(entry[0])
+                || entry[0] < 1
+                || !entry[1]
+                || entry[1].cuenta_id !== entry[0]
+                || !Number.isSafeInteger(entry[1].mesa_id)
+                || entry[1].mesa_id < 1
+                || typeof entry[1].clave_idempotencia !== "string"
+                || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+                    .test(entry[1].clave_idempotencia)
+                || !/^(0|[1-9]\d*)\.\d{2}$/.test(entry[1].total_esperado)
+                || !Array.isArray(entry[1].importes)
+            ) {
+                throw new Error("El registro local de cobros inciertos tiene datos inválidos.");
+            }
+            const seenMethods = new Set();
+            for (const payment of entry[1].importes) {
+                if (
+                    !payment
+                    || !["EFECTIVO", "TRANSFERENCIA", "TARJETA"].includes(payment.medio)
+                    || seenMethods.has(payment.medio)
+                    || !/^[1-9]\d*\.\d{2}$/.test(payment.importe)
+                ) {
+                    throw new Error("El registro local de cobros inciertos tiene pagos inválidos.");
+                }
+                seenMethods.add(payment.medio);
+            }
+            uncertainAccountPayments.set(entry[0], entry[1]);
+        }
+        return "";
+    } catch (error) {
+        uncertainAccountPayments.clear();
+        return error.message || "No se pudieron recuperar las claves de cobro inciertas.";
+    }
+}
+
+function persistUncertainAccountPayments() {
+    try {
+        sessionStorage.setItem(
+            uncertainPaymentsStorageKey(currentUser.id),
+            JSON.stringify([...uncertainAccountPayments.entries()]),
+        );
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function restoreUncertainCancellationRequests(userId) {
@@ -439,6 +508,8 @@ function canLoadOrder(cuenta) {
 
 function canPlaceOrder(cuenta) {
     if (!currentUser) return false;
+    if (cuenta && uncertainAccountPayments.has(cuenta.id)) return false;
+    if (cuenta && cuenta.estado === "INCIERTA") return false;
     if (currentUser.rol === "MOZO") {
         return !cuenta
             || cuenta.mozo_responsable_id === null
@@ -450,6 +521,15 @@ function canPlaceOrder(cuenta) {
 }
 
 function canRequestCancellation(cuenta) {
+    return Boolean(
+        currentUser
+        && currentUser.rol === "MOZO"
+        && cuenta
+        && cuenta.mozo_responsable_id === currentUser.id,
+    );
+}
+
+function canChargeAccount(cuenta) {
     return Boolean(
         currentUser
         && currentUser.rol === "MOZO"
@@ -527,8 +607,12 @@ function renderTableButton(mesa, cuenta) {
     button.type = "button";
     button.append(makeElement("span", "zone-table-number", String(mesa.numero)));
     const uncertain = uncertainOrderAccounts.has(mesa.id);
+    const uncertainPayment = [...uncertainAccountPayments.entries()]
+        .find(([, operation]) => operation.mesa_id === mesa.id);
     const status = !cuenta
-        ? "Sin cuenta abierta"
+        ? uncertainPayment
+            ? "Cobro sin confirmar · seleccioná para reintentar"
+            : "Sin cuenta abierta"
         : `Cuenta abierta · ${cuenta.mozo_responsable_nombre || "Sin responsable"}`;
     button.setAttribute(
         "aria-label",
@@ -539,7 +623,19 @@ function renderTableButton(mesa, cuenta) {
     button.dataset.tableId = String(mesa.id);
     button.disabled = !canLoadOrder(cuenta) || uncertain;
     if (!button.disabled) {
-        button.addEventListener("click", () => openAccountForm(mesa, cuenta));
+        button.addEventListener("click", () => {
+            if (!cuenta && uncertainPayment) {
+                openAccountForm(mesa, {
+                    id: uncertainPayment[0],
+                    mesa: mesa.id,
+                    estado: "INCIERTA",
+                    mozo_responsable_id: currentUser.id,
+                    mozo_responsable_nombre: currentUser.username,
+                });
+            } else {
+                openAccountForm(mesa, cuenta);
+            }
+        });
     }
     return button;
 }
@@ -551,6 +647,18 @@ function formatMoney(value) {
         style: "currency",
         currency: "ARS",
     }).format(amount);
+}
+
+function moneyToCents(value) {
+    const normalized = String(value).trim().replace(",", ".");
+    if (!/^(0|[1-9]\d*)(?:\.\d{1,2})?$/.test(normalized)) return null;
+    const [whole, fraction = ""] = normalized.split(".");
+    const cents = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+    return Number.isSafeInteger(cents) ? cents : null;
+}
+
+function centsToMoney(cents) {
+    return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
 }
 
 function setOrderMessage(text, isError = false, isUncertain = false) {
@@ -757,6 +865,105 @@ function setAccountMessage(text, isError = false) {
     message.hidden = !text;
 }
 
+function setAccountPaymentMessage(text, isError = false) {
+    const message = document.getElementById("payment-message");
+    message.textContent = text;
+    message.classList.toggle("message-error", isError);
+    message.hidden = !text;
+}
+
+function accountPaymentValues() {
+    return ["EFECTIVO", "TRANSFERENCIA", "TARJETA"].map((medio) => ({
+        medio,
+        input: document.querySelector(`#payment-${medio.toLowerCase()}`),
+    }));
+}
+
+function updateAccountPayment() {
+    const form = document.getElementById("account-payment");
+    if (!form) return;
+    const cuenta = accountContext && accountContext.cuenta;
+    const enabled = canChargeAccount(cuenta);
+    form.hidden = !enabled;
+    if (!enabled) return;
+
+    const retryOperation = uncertainAccountPayments.get(cuenta.id);
+    document.getElementById("payment-current-total").textContent =
+        accountTotalCents === null
+            ? "Consultando el total vigente…"
+            : `Total vigente: ${formatMoney(centsToMoney(accountTotalCents))}`;
+    document.getElementById("payment-methods").hidden =
+        accountTotalCents === 0;
+
+    let amountCents = 0;
+    let valid = true;
+    for (const { input } of accountPaymentValues()) {
+        input.disabled = accountPaymentPending || Boolean(retryOperation);
+        if (input.value.trim() === "") continue;
+        const cents = moneyToCents(input.value);
+        if (cents === null || cents <= 0) {
+            valid = false;
+        } else {
+            amountCents += cents;
+        }
+    }
+    const difference = accountTotalCents === null
+        ? null
+        : accountTotalCents - amountCents;
+    const differenceLabel = difference === null
+        ? "Diferencia pendiente: —"
+        : difference > 0
+            ? `Diferencia pendiente: ${formatMoney(centsToMoney(difference))}`
+            : difference < 0
+                ? `Excede el total por: ${formatMoney(centsToMoney(-difference))}`
+                : "Diferencia pendiente: $0,00";
+    document.getElementById("payment-difference").textContent =
+        retryOperation
+            ? "Hay un cobro sin confirmación. Reintentá la misma operación."
+            : differenceLabel;
+
+    const submit = document.getElementById("account-payment-submit");
+    submit.disabled = accountPaymentPending
+        || (accountTotalCents === null && !retryOperation)
+        || (!retryOperation && (
+            accountConsumptionStale
+            || !valid
+            || (accountTotalCents > 0 && amountCents !== accountTotalCents)
+        ));
+    submit.textContent = accountPaymentPending
+        ? "Procesando…"
+        : retryOperation
+            ? "Reintentar cobro y cierre"
+            : accountTotalCents === 0
+                ? "Cerrar cuenta"
+                : "Cobrar y cerrar";
+    for (const { input } of accountPaymentValues()) {
+        input.disabled = accountPaymentPending || Boolean(retryOperation)
+            || accountTotalCents === 0;
+    }
+}
+
+function initializeAccountPaymentForm(cuenta) {
+    const form = document.getElementById("account-payment");
+    form.reset();
+    accountTotalCents = null;
+    accountPaymentPending = false;
+    setAccountPaymentMessage("");
+    if (cuenta) {
+        const operation = uncertainAccountPayments.get(cuenta.id);
+        if (operation) {
+            const fields = new Map(accountPaymentValues().map(({ medio, input }) => [
+                medio,
+                input,
+            ]));
+            for (const payment of operation.importes) {
+                fields.get(payment.medio).value = payment.importe;
+            }
+        }
+    }
+    updateAccountPayment();
+}
+
 function showNoConsumption() {
     const container = document.getElementById("account-consumption");
     container.replaceChildren(makeElement("p", "summary-empty", "Sin consumos"));
@@ -764,6 +971,8 @@ function showNoConsumption() {
     const total = document.getElementById("account-total");
     total.textContent = "Total acumulado: $0,00";
     total.hidden = false;
+    accountTotalCents = 0;
+    updateAccountPayment();
 }
 
 function showUnassignedAccountMessage() {
@@ -782,6 +991,8 @@ function showAccountError(message) {
     document.getElementById("consumption-loading").hidden = true;
     document.getElementById("account-consumption").replaceChildren();
     document.getElementById("account-total").hidden = true;
+    accountTotalCents = null;
+    updateAccountPayment();
     setAccountMessage(message, true);
 }
 
@@ -823,7 +1034,7 @@ function fetchAccountConsumption(cuentaId) {
     return request;
 }
 
-async function refreshAccountConsumptionAfterCancellation(cuentaId) {
+async function refreshAccountConsumption(cuentaId) {
     if (
         !accountContext
         || !accountContext.cuenta
@@ -832,6 +1043,7 @@ async function refreshAccountConsumptionAfterCancellation(cuentaId) {
     ) return false;
 
     accountConsumptionStale = true;
+    updateAccountPayment();
     if (document.getElementById("account-overlay").hidden) {
         return true;
     }
@@ -872,8 +1084,13 @@ async function refreshAccountConsumptionAfterCancellation(cuentaId) {
                 return true;
             }
             reconcileUncertainCancellationRequests(cuentaId, data);
-            renderAccountConsumption(data);
             accountConsumptionStale = false;
+            if (accountContext.cuenta.estado === "INCIERTA") {
+                accountContext.cuenta.estado = "ABIERTA";
+                updateAccountHeader();
+            }
+            renderAccountConsumption(data);
+            updateAccountPayment();
             if (uncertainOrderAccounts.has(accountContext.mesa.id)) {
                 updateAccountHeader();
             } else {
@@ -891,6 +1108,7 @@ async function refreshAccountConsumptionAfterCancellation(cuentaId) {
                 && !document.getElementById("account-overlay").hidden
             ) {
                 accountConsumptionStale = true;
+                updateAccountPayment();
                 setAccountMessage(
                     "No se pudo actualizar el consumo. Se conserva la información mostrada.",
                 );
@@ -1052,6 +1270,8 @@ function renderAccountConsumption(consumption) {
     const total = document.getElementById("account-total");
     total.textContent = `Total acumulado: ${formatMoney(consumption.total)}`;
     total.hidden = false;
+    accountTotalCents = moneyToCents(consumption.total);
+    updateAccountPayment();
     container.scrollTop = scrollTop;
     if (focusedDetailId) {
         const replacement = [...container.querySelectorAll(
@@ -1108,20 +1328,28 @@ async function loadAccountConsumption(
     const loading = document.getElementById("consumption-loading");
     document.getElementById("account-consumption").replaceChildren();
     document.getElementById("account-total").hidden = true;
+    accountTotalCents = null;
+    updateAccountPayment();
     setAccountMessage("");
     loading.hidden = false;
     try {
         const data = await fetchAccountConsumption(cuenta.id);
         if (!isCurrentAccountView(generation)) return false;
         reconcileUncertainCancellationRequests(cuenta.id, data);
-        renderAccountConsumption(data);
         accountConsumptionStale = false;
+        if (cuenta.estado === "INCIERTA") {
+            cuenta.estado = "ABIERTA";
+            updateAccountHeader();
+        }
+        renderAccountConsumption(data);
+        updateAccountPayment();
         return true;
     } catch (error) {
         if (!isCurrentAccountView(generation)) return false;
         if (error instanceof StaleApiReadError) {
             accountConsumptionStale = true;
             document.getElementById("consumption-loading").hidden = true;
+            updateAccountPayment();
             return false;
         }
         showAccountError(failureMessage
@@ -1136,6 +1364,7 @@ function openAccountForm(mesa, cuenta) {
     accountReturnFocus = document.activeElement;
     accountContext = { mesa, cuenta: cuenta || null };
     accountConsumptionStale = false;
+    initializeAccountPaymentForm(cuenta);
     const generation = ++accountViewGeneration;
     document.querySelector(".topbar").inert = true;
     document.querySelector(".page-shell").inert = true;
@@ -1158,10 +1387,12 @@ function closeAccountForm() {
     if (
         document.getElementById("account-overlay").hidden
         || !document.getElementById("order-overlay").hidden
+        || accountPaymentPending
     ) return;
     accountViewGeneration += 1;
     accountContext = null;
     accountConsumptionStale = false;
+    accountTotalCents = null;
     document.getElementById("account-overlay").hidden = true;
     setActiveFormOverlay(null);
     document.querySelector(".topbar").inert = false;
@@ -1169,7 +1400,7 @@ function closeAccountForm() {
     if (accountReturnFocus && accountReturnFocus.isConnected) {
         accountReturnFocus.focus();
     } else {
-        document.getElementById("refresh-button").focus();
+        document.querySelector("#zones .zone-table-button")?.focus();
     }
     accountReturnFocus = null;
 }
@@ -1260,7 +1491,7 @@ function closeCancellationForm(restoreFocus = true) {
     }
     cancellationReturnFocus = null;
     if (accountConsumptionStale && accountContext && accountContext.cuenta) {
-        refreshAccountConsumptionAfterCancellation(accountContext.cuenta.id);
+        refreshAccountConsumption(accountContext.cuenta.id);
     }
 }
 
@@ -1397,6 +1628,178 @@ async function submitCancellation(event) {
     }
 }
 
+async function submitAccountPayment(event) {
+    event.preventDefault();
+    if (
+        !accountContext
+        || !accountContext.cuenta
+        || !canChargeAccount(accountContext.cuenta)
+        || accountPaymentPending
+    ) return;
+
+    const cuentaId = accountContext.cuenta.id;
+    const savedOperation = uncertainAccountPayments.get(cuentaId);
+    let operation = savedOperation;
+    if (!operation) {
+        if (accountTotalCents === null || accountConsumptionStale) {
+            setAccountPaymentMessage(
+                "Actualizá el consumo antes de cobrar la cuenta.",
+                true,
+            );
+            return;
+        }
+        const importes = [];
+        let totalIngresado = 0;
+        for (const { medio, input } of accountPaymentValues()) {
+            if (input.value.trim() === "") continue;
+            const cents = moneyToCents(input.value);
+            if (cents === null || cents <= 0) {
+                setAccountPaymentMessage(
+                    "Cada importe debe ser un monto positivo con hasta dos decimales.",
+                    true,
+                );
+                return;
+            }
+            totalIngresado += cents;
+            importes.push({
+                medio,
+                importe: centsToMoney(cents),
+            });
+        }
+        if (
+            (accountTotalCents === 0 && importes.length > 0)
+            || (accountTotalCents > 0 && totalIngresado !== accountTotalCents)
+        ) {
+            setAccountPaymentMessage(
+                "La suma de los medios debe coincidir exactamente con el total vigente.",
+                true,
+            );
+            return;
+        }
+        try {
+            operation = {
+                cuenta_id: cuentaId,
+                mesa_id: accountContext.mesa.id,
+                clave_idempotencia: generateIdempotencyKey(),
+                total_esperado: centsToMoney(accountTotalCents),
+                importes,
+            };
+        } catch (error) {
+            setAccountPaymentMessage(
+                error.message || "No se pudo generar una clave segura para el cobro.",
+                true,
+            );
+            return;
+        }
+    }
+
+    const lines = operation.importes.length
+        ? operation.importes.map(
+            ({ medio, importe }) => `${medio}: ${formatMoney(importe)}`,
+        ).join("\n")
+        : "Sin pagos: el total es $0,00.";
+    const verb = savedOperation ? "Reintentar el cobro" : "Registrar el cobro";
+    if (!window.confirm(
+        `${verb} por ${formatMoney(operation.total_esperado)} y cerrar la cuenta?\n\n${lines}`,
+    )) return;
+
+    if (!savedOperation) {
+        uncertainAccountPayments.set(cuentaId, operation);
+        if (!persistUncertainAccountPayments()) {
+            uncertainAccountPayments.delete(cuentaId);
+            setAccountPaymentMessage(
+                "No se pudo guardar la clave del cobro en esta sesión. No se envió la operación.",
+                true,
+            );
+            return;
+        }
+    }
+
+    const contextAtStart = accountContext;
+    const generation = accountViewGeneration;
+    accountPaymentPending = true;
+    setAccountPaymentMessage("");
+    updateAccountPayment();
+    let result;
+    try {
+        result = await fetchApi(API.cobrarCuenta(cuentaId), {
+            method: "POST",
+            body: JSON.stringify({
+                clave_idempotencia: operation.clave_idempotencia,
+                total_esperado: operation.total_esperado,
+                importes: operation.importes,
+            }),
+        });
+    } catch (error) {
+        if (
+            accountContext !== contextAtStart
+            || accountViewGeneration !== generation
+        ) return;
+        accountPaymentPending = false;
+        const rejected = Number.isInteger(error.status)
+            && error.status >= 400
+            && error.status < 500;
+        if (rejected) {
+            uncertainAccountPayments.delete(cuentaId);
+            persistUncertainAccountPayments();
+            if (error.status === 409) {
+                accountConsumptionStale = true;
+            }
+        }
+        updateAccountPayment();
+        setAccountPaymentMessage(
+            rejected
+                ? error.message || "No se pudo cobrar y cerrar la cuenta."
+                : "No se pudo confirmar el resultado del cobro. Reintentá la misma operación; no se duplicará.",
+            true,
+        );
+        if (
+            error.status === 409
+            || accountContext.cuenta.estado === "INCIERTA"
+        ) {
+            await refreshAccountConsumption(cuentaId);
+        }
+        return;
+    }
+
+    if (
+        !result
+        || result.cuenta !== cuentaId
+        || result.total_cobrado !== operation.total_esperado
+    ) {
+        accountPaymentPending = false;
+        updateAccountPayment();
+        setAccountPaymentMessage(
+            "La respuesta del servidor no confirmó el cobro. Reintentá la misma operación; no se duplicará.",
+            true,
+        );
+        return;
+    }
+
+    recentlyClosedAccountIds.add(cuentaId);
+    uncertainAccountPayments.delete(cuentaId);
+    const pendingStateCleared = persistUncertainAccountPayments();
+    accountPaymentPending = false;
+    if (accountContext === contextAtStart) {
+        closeAccountForm();
+    }
+    if (!pendingStateCleared) {
+        showMessage(
+            "El cobro quedó confirmado, pero no se pudo limpiar su estado local. "
+                + "No vuelvas a cobrar esta cuenta.",
+            true,
+        );
+    }
+
+    const refreshedTables = await loadTables();
+    if (!refreshedTables) {
+        showMessage(
+            "El cobro quedó confirmado y la cuenta está cerrada, pero no se pudieron actualizar las mesas.",
+            true,
+        );
+    }
+}
+
 function showCancellationMessage(text, isError = false) {
     const message = document.getElementById("cancellation-message");
     message.textContent = text;
@@ -1505,7 +1908,7 @@ function closeOrderForm(refreshConsumption = true, restoreFocus = true) {
     if (refreshConsumption) {
         const generation = ++accountViewGeneration;
         if (accountConsumptionStale && accountContext && accountContext.cuenta) {
-            refreshAccountConsumptionAfterCancellation(
+            refreshAccountConsumption(
                 accountContext.cuenta.id,
             );
         } else {
@@ -1662,7 +2065,14 @@ function renderTables(mesas, cuentas) {
         restoreListView(container, viewState);
         return;
     }
-    const accountsByTable = new Map(cuentas.map((cuenta) => [cuenta.mesa, cuenta]));
+    const accountsByTable = new Map(
+        cuentas
+            .filter((cuenta) => (
+                !recentlyClosedAccountIds.has(cuenta.id)
+                && !uncertainAccountPayments.has(cuenta.id)
+            ))
+            .map((cuenta) => [cuenta.mesa, cuenta]),
+    );
     const knownZones = new Map(ZONES);
     const zoneKeys = [...ZONES.map(([key]) => key)];
     for (const mesa of mesas) {
@@ -2481,12 +2891,12 @@ async function refreshCancellationNotifications(
                 setNotificationError("");
             }
             for (const cuentaId of changedAccountIds) {
-                await refreshAccountConsumptionAfterCancellation(cuentaId);
+                await refreshAccountConsumption(cuentaId);
             }
             return true;
         } catch (error) {
             if (Number.isSafeInteger(forceAccountId) && forceAccountId > 0) {
-                await refreshAccountConsumptionAfterCancellation(forceAccountId);
+                await refreshAccountConsumption(forceAccountId);
             }
             if (!silent) {
                 showNotificationError(
@@ -2572,7 +2982,7 @@ function refreshOperationalData(immediate = false, forceAccountId = null, succes
                         && canViewCurrentAccountConsumption(accountContext.cuenta)
                     ) {
                         tasks.push(
-                            refreshAccountConsumptionAfterCancellation(
+                            refreshAccountConsumption(
                                 accountContext.cuenta.id,
                             ),
                         );
@@ -2694,6 +3104,7 @@ async function initializeOperationalPage() {
     const uncertainRestoreError = restoreUncertainOrderMesas(user.id);
     const cancellationRestoreError =
         restoreUncertainCancellationRequests(user.id);
+    const paymentRestoreError = restoreUncertainAccountPayments(user.id);
     initializeCancellationNotifications();
 
     if (document.body.dataset.page === "mesas") {
@@ -2745,6 +3156,7 @@ async function initializeOperationalPage() {
     startOperationalRefresh();
     if (uncertainRestoreError) showMessage(uncertainRestoreError, true);
     if (cancellationRestoreError) showMessage(cancellationRestoreError, true);
+    if (paymentRestoreError) showMessage(paymentRestoreError, true);
 }
 
 function initializeCancellationForm() {
@@ -2773,6 +3185,16 @@ function initializeOrderForm() {
     document.getElementById("order-cancel").addEventListener("click", closeOrderForm);
     document.getElementById("new-order-open").addEventListener("click", openOrderForm);
     document.getElementById("account-close").addEventListener("click", closeAccountForm);
+    document.getElementById("account-payment").addEventListener(
+        "submit",
+        submitAccountPayment,
+    );
+    document.querySelectorAll("#payment-methods input").forEach((input) => {
+        input.addEventListener("input", () => {
+            setAccountPaymentMessage("");
+            updateAccountPayment();
+        });
+    });
     document.getElementById("account-consumption").addEventListener(
         "click",
         (event) => {

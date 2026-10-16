@@ -10,8 +10,10 @@ from usuarios.models import Sector, User
 from .models import (
     AvisoCargaBarra,
     AvisoRetiro,
+    CobroCuenta,
     Cuenta,
     DetallePedido,
+    ImportePagoCuenta,
     Mesa,
     Pedido,
     PreparacionPedidoSector,
@@ -21,6 +23,7 @@ from .services import (
     cantidad_vigente,
     cantidades_cancelacion,
     resumen_detalle_consumo,
+    total_vigente_cuenta,
 )
 
 
@@ -589,23 +592,68 @@ class CuentaConsumoSerializer(serializers.ModelSerializer):
         }
 
     def get_total(self, cuenta):
-        return sum(
-            (
-                detalle.precio_unitario
-                * (
-                    detalle.cantidad
-                    - sum(
-                        solicitud.cantidad
-                        for solicitud in detalle.solicitudes_cancelacion.all()
-                        if solicitud.estado
-                        == SolicitudCancelacionDetalle.Estado.ACEPTADA
-                    )
-                )
-                for pedido in cuenta.pedidos.all()
-                for detalle in pedido.detalles.all()
-            ),
-            Decimal("0.00"),
-        )
+        return total_vigente_cuenta(cuenta)
+
+
+class ImportePagoCuentaInputSerializer(serializers.Serializer):
+    medio = serializers.ChoiceField(choices=CobroCuenta.Medio.choices)
+    importe = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+
+
+class CobroCuentaCreateSerializer(serializers.Serializer):
+    clave_idempotencia = serializers.UUIDField()
+    total_esperado = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0.00"),
+    )
+    importes = ImportePagoCuentaInputSerializer(many=True)
+
+    def validate_importes(self, importes):
+        medios = [item["medio"] for item in importes]
+        if len(medios) != len(set(medios)):
+            raise serializers.ValidationError(
+                "Cada medio de pago puede aparecer una sola vez.",
+            )
+        return importes
+
+    def validate(self, attrs):
+        if attrs["total_esperado"] == 0 and attrs["importes"]:
+            raise serializers.ValidationError(
+                {"importes": "Una cuenta en cero se cierra sin registrar pagos."},
+            )
+        if attrs["total_esperado"] > 0 and not attrs["importes"]:
+            raise serializers.ValidationError(
+                {"importes": "Ingresá al menos un medio de pago."},
+            )
+        return attrs
+
+
+class ImportePagoCuentaSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ImportePagoCuenta
+        fields = ["medio", "importe"]
+        read_only_fields = fields
+
+
+class CobroCuentaSerializer(serializers.ModelSerializer):
+    importes = ImportePagoCuentaSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CobroCuenta
+        fields = [
+            "id",
+            "cuenta",
+            "mozo",
+            "fecha_cobro",
+            "total_cobrado",
+            "importes",
+        ]
+        read_only_fields = fields
 
 
 class MesaSerializer(serializers.ModelSerializer):

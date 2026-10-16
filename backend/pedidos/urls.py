@@ -8,6 +8,7 @@ from .views import (
     AvisosRetiroListView,
     ConfirmarRetiroView,
     ControlRetiroBarraListView,
+    CobrarCuentaView,
     CuentaConsumoView,
     MesaListView,
     BarraPedidoCreateView,
@@ -61,6 +62,11 @@ urlpatterns = [
         "cuentas/<int:pk>/consumo/",
         CuentaConsumoView.as_view(),
         name="cuenta-consumo",
+    ),
+    path(
+        "cuentas/<int:pk>/cobrar/",
+        CobrarCuentaView.as_view(),
+        name="cuenta-cobrar",
     ),
     path(
         "cuentas/<int:cuenta_id>/detalles/<int:detalle_id>/cancelaciones/",

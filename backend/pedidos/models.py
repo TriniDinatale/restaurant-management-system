@@ -98,6 +98,62 @@ class Cuenta(models.Model):
         )
 
 
+class CobroCuenta(models.Model):
+    class Medio(models.TextChoices):
+        EFECTIVO = "EFECTIVO", "Efectivo"
+        TRANSFERENCIA = "TRANSFERENCIA", "Transferencia"
+        TARJETA = "TARJETA", "Tarjeta"
+
+    cuenta = models.OneToOneField(
+        Cuenta,
+        on_delete=models.PROTECT,
+        related_name="cobro",
+    )
+    mozo = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="cobros_cuenta",
+    )
+    fecha_cobro = models.DateTimeField(auto_now_add=True)
+    total_cobrado = models.DecimalField(max_digits=12, decimal_places=2)
+    total_esperado = models.DecimalField(max_digits=12, decimal_places=2)
+    clave_idempotencia = models.UUIDField(unique=True, editable=False)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(total_cobrado__gte=0),
+                name="cobro_cuenta_total_no_negativo",
+            ),
+            models.CheckConstraint(
+                condition=Q(total_esperado__gte=0),
+                name="cobro_cuenta_esperado_no_negativo",
+            ),
+        ]
+
+
+class ImportePagoCuenta(models.Model):
+    cobro = models.ForeignKey(
+        CobroCuenta,
+        on_delete=models.PROTECT,
+        related_name="importes",
+    )
+    medio = models.CharField(max_length=20, choices=CobroCuenta.Medio.choices)
+    importe = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cobro", "medio"],
+                name="unique_medio_por_cobro",
+            ),
+            models.CheckConstraint(
+                condition=Q(importe__gt=0),
+                name="importe_pago_cuenta_positivo",
+            ),
+        ]
+
+
 class Pedido(models.Model):
     mesa = models.ForeignKey(
         Mesa,

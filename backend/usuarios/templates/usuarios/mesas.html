@@ -103,6 +103,26 @@
             <div id="account-consumption" class="account-consumption"></div>
         </div>
         <p id="account-total" class="consumption-total account-total" hidden></p>
+        <form id="account-payment" class="account-payment" hidden>
+            <h2 id="account-payment-title">Cobro de la cuenta</h2>
+            <p id="payment-current-total" class="intro"></p>
+            <div id="payment-methods" class="payment-methods">
+                <label for="payment-efectivo">Efectivo</label>
+                <input id="payment-efectivo" name="EFECTIVO" type="text"
+                       inputmode="decimal" autocomplete="off" placeholder="0,00">
+                <label for="payment-transferencia">Transferencia</label>
+                <input id="payment-transferencia" name="TRANSFERENCIA" type="text"
+                       inputmode="decimal" autocomplete="off" placeholder="0,00">
+                <label for="payment-tarjeta">Tarjeta</label>
+                <input id="payment-tarjeta" name="TARJETA" type="text"
+                       inputmode="decimal" autocomplete="off" placeholder="0,00">
+            </div>
+            <p id="payment-difference" class="payment-difference" aria-live="polite"></p>
+            <div id="payment-message" class="message" role="alert" aria-live="polite" hidden></div>
+            <button id="account-payment-submit" class="button button-primary" type="submit" disabled>
+                Cobrar y cerrar
+            </button>
+        </form>
     </section>
 </div>
 <div id="order-overlay" class="order-overlay" hidden>

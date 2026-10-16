@@ -2,7 +2,7 @@
 from decimal import Decimal
 from datetime import timedelta
 from types import SimpleNamespace
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 import time
 
 from django.core.exceptions import ValidationError
@@ -17,8 +17,10 @@ from usuarios.models import Sector, User
 from .models import (
     AvisoRetiro,
     AvisoCargaBarra,
+    CobroCuenta,
     Cuenta,
     DetallePedido,
+    ImportePagoCuenta,
     LecturaNotificacionCancelacion,
     Mesa,
     Pedido,
@@ -30,7 +32,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 from django.db import IntegrityError
 from uuid import uuid4
 
@@ -4633,3 +4635,545 @@ class AvisoCancelacionConcurrenteTests(TransactionTestCase):
                 clave_idempotencia=idempotency_key,
             ).exists(),
         )
+
+
+class CobrarCuentaAPITests(APITestCase):
+    def setUp(self):
+        self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        self.barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.mozo = User.objects.create_user(
+            username="cobro_mozo",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.otro_mozo = User.objects.create_user(
+            username="cobro_otro_mozo",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+        self.usuario_barra = User.objects.create_user(
+            username="cobro_barra",
+            password="test-password",
+            rol=User.Rol.BARRA,
+            sector=self.barra,
+        )
+        self.mesa = Mesa.objects.create(numero=130)
+        self.cuenta = Cuenta.objects.create(
+            mesa=self.mesa,
+            mozo_responsable=self.mozo,
+        )
+        self.categoria = Categoria.objects.create(nombre="Cobros")
+        self.producto = Producto.objects.create(
+            nombre="Producto de cobro",
+            precio=Decimal("1200.00"),
+            categoria=self.categoria,
+            sector_destino=self.barra,
+        )
+        self.pedido = Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=self.cuenta,
+            mozo=self.mozo,
+            creado_por=self.mozo,
+        )
+        self.detalle = DetallePedido.objects.create(
+            pedido=self.pedido,
+            producto=self.producto,
+            cantidad=1,
+        )
+        self.url = reverse("cuenta-cobrar", args=[self.cuenta.pk])
+
+    def pagar(self, *, total="1200.00", importes=None, clave=None):
+        self.client.force_authenticate(user=self.mozo)
+        return self.client.post(
+            self.url,
+            {
+                "clave_idempotencia": clave or uuid4(),
+                "total_esperado": total,
+                "importes": importes if importes is not None else [
+                    {"medio": "EFECTIVO", "importe": "1200.00"},
+                ],
+            },
+            format="json",
+        )
+
+    def test_cobro_con_un_medio_conserva_historial_y_cierra(self):
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["cuenta"], self.cuenta.pk)
+        self.assertEqual(response.data["total_cobrado"], "1200.00")
+        self.assertEqual(len(response.data["importes"]), 1)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.CERRADA)
+        self.assertEqual(self.cuenta.pedidos.count(), 1)
+        cobro = CobroCuenta.objects.get(cuenta=self.cuenta)
+        self.assertEqual(cobro.mozo, self.mozo)
+        self.assertEqual(cobro.total_cobrado, Decimal("1200.00"))
+        self.assertEqual(
+            list(cobro.importes.values_list("medio", "importe")),
+            [("EFECTIVO", Decimal("1200.00"))],
+        )
+
+    def test_cobro_combinado_y_productos_no_entregados_son_admitidos(self):
+        response = self.pagar(
+            importes=[
+                {"medio": "EFECTIVO", "importe": "500.00"},
+                {"medio": "TRANSFERENCIA", "importe": "400.00"},
+                {"medio": "TARJETA", "importe": "300.00"},
+            ],
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            CobroCuenta.objects.get(cuenta=self.cuenta).importes.count(),
+            3,
+        )
+
+    def test_cobro_usa_cantidad_vigente_y_conserva_cancelaciones(self):
+        self.detalle.cantidad = 2
+        self.detalle.save()
+        solicitud = SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Unidad cancelada",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.usuario_barra,
+            fecha_resolucion=timezone.now(),
+        )
+
+        response = self.pagar(total="1200.00")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.cuenta.refresh_from_db()
+        solicitud.refresh_from_db()
+        self.assertEqual(self.cuenta.pedidos.get().detalles.get().cantidad, 2)
+        self.assertEqual(solicitud.estado, SolicitudCancelacionDetalle.Estado.ACEPTADA)
+        self.assertEqual(
+            CobroCuenta.objects.get(cuenta=self.cuenta).total_cobrado,
+            Decimal("1200.00"),
+        )
+
+    def test_importes_invalidos_insuficientes_y_excesivos_no_cierran(self):
+        casos = [
+            [{"medio": "EFECTIVO", "importe": "-1.00"}],
+            [{"medio": "EFECTIVO", "importe": "0.00"}],
+            [{"medio": "EFECTIVO", "importe": "1199.99"}],
+            [{"medio": "EFECTIVO", "importe": "1200.01"}],
+        ]
+        for importes in casos:
+            with self.subTest(importes=importes):
+                response = self.pagar(importes=importes)
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(CobroCuenta.objects.count(), 0)
+                self.cuenta.refresh_from_db()
+                self.assertEqual(self.cuenta.estado, Cuenta.Estado.ABIERTA)
+
+    def test_importe_enviado_no_reemplaza_total_calculado_por_servidor(self):
+        response = self.pagar(
+            total="999.00",
+            importes=[{"medio": "EFECTIVO", "importe": "999.00"}],
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(CobroCuenta.objects.count(), 0)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.ABIERTA)
+
+    def test_total_cero_cierra_sin_registrar_pagos(self):
+        solicitud = SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Se canceló toda la unidad",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.usuario_barra,
+            fecha_resolucion=timezone.now(),
+        )
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.ABIERTA)
+
+        response = self.pagar(total="0.00", importes=[])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["total_cobrado"], "0.00")
+        self.assertEqual(response.data["importes"], [])
+        self.cuenta.refresh_from_db()
+        solicitud.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.CERRADA)
+        self.assertEqual(solicitud.estado, SolicitudCancelacionDetalle.Estado.ACEPTADA)
+        self.assertEqual(self.cuenta.pedidos.count(), 1)
+
+    def test_cancelacion_pendiente_impide_cerrar(self):
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="A confirmar",
+        )
+
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertFalse(CobroCuenta.objects.filter(cuenta=self.cuenta).exists())
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.ABIERTA)
+
+    def test_solo_responsable_puede_cobrar_y_cuenta_historica_no_se_asigna(self):
+        for usuario in [self.otro_mozo, self.usuario_barra]:
+            self.client.force_authenticate(user=usuario)
+            response = self.client.post(
+                self.url,
+                {
+                    "clave_idempotencia": uuid4(),
+                    "total_esperado": "1200.00",
+                    "importes": [
+                        {"medio": "EFECTIVO", "importe": "1200.00"},
+                    ],
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.cuenta.mozo_responsable = None
+        self.cuenta.save(update_fields=["mozo_responsable"])
+        self.client.force_authenticate(user=self.mozo)
+        response = self.client.post(
+            self.url,
+            {
+                "clave_idempotencia": uuid4(),
+                "total_esperado": "1200.00",
+                "importes": [{"medio": "EFECTIVO", "importe": "1200.00"}],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("histórica", str(response.data))
+        self.assertFalse(CobroCuenta.objects.exists())
+
+    def test_reintento_idempotente_devuelve_cobro_y_datos_distintos_conflictuan(self):
+        clave = uuid4()
+        importes = [
+            {"medio": "EFECTIVO", "importe": "600.00"},
+            {"medio": "TARJETA", "importe": "600.00"},
+        ]
+        primera = self.pagar(importes=importes, clave=clave)
+        repetida = self.pagar(importes=importes, clave=clave)
+        distinta = self.pagar(
+            importes=[
+                {"medio": "TRANSFERENCIA", "importe": "1200.00"},
+            ],
+            clave=clave,
+        )
+
+        self.assertEqual(primera.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(repetida.status_code, status.HTTP_200_OK)
+        self.assertEqual(repetida.data["id"], primera.data["id"])
+        self.assertEqual(distinta.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(CobroCuenta.objects.count(), 1)
+        self.assertEqual(ImportePagoCuenta.objects.count(), 2)
+
+    def test_error_al_preparar_respuesta_no_confirma_cobro_ni_cierre(self):
+        with patch(
+            "pedidos.views.CobroCuentaSerializer.data",
+            new_callable=PropertyMock,
+            side_effect=RuntimeError("Error simulado al serializar el cobro."),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.pagar()
+
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.ABIERTA)
+        self.assertFalse(CobroCuenta.objects.filter(cuenta=self.cuenta).exists())
+        self.assertFalse(ImportePagoCuenta.objects.exists())
+
+    def test_cuenta_cerrada_rechaza_pedido_y_cancelacion_y_mesa_admite_nueva_cuenta(self):
+        original_order_id = self.pedido.pk
+        closed_response = self.pagar()
+        self.assertEqual(closed_response.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.mozo)
+        old_account_order = self.client.post(
+            reverse("pedido-create"),
+            {
+                "mesa": self.mesa.pk,
+                "cuenta": self.cuenta.pk,
+                "detalles": [{"producto": self.producto.pk, "cantidad": 1}],
+            },
+            format="json",
+        )
+        old_account_cancellation = self.client.post(
+            reverse(
+                "detalle-solicitar-cancelacion",
+                args=[self.cuenta.pk, self.detalle.pk],
+            ),
+            {
+                "clave_idempotencia": uuid4(),
+                "cantidad": 1,
+                "motivo": "Cuenta cerrada",
+            },
+            format="json",
+        )
+        self.assertEqual(old_account_order.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(old_account_cancellation.status_code, status.HTTP_404_NOT_FOUND)
+
+        new_order_response = self.client.post(
+            reverse("pedido-mesa-create"),
+            {
+                "mesa": self.mesa.pk,
+                "detalles": [{"producto": self.producto.pk, "cantidad": 2}],
+            },
+            format="json",
+        )
+        self.assertEqual(new_order_response.status_code, status.HTTP_201_CREATED)
+        new_account = Cuenta.objects.get(estado=Cuenta.Estado.ABIERTA, mesa=self.mesa)
+        self.assertNotEqual(new_account.pk, self.cuenta.pk)
+        self.assertEqual(new_account.mozo_responsable, self.mozo)
+        self.assertEqual(new_account.pedidos.count(), 1)
+        self.assertEqual(self.cuenta.pedidos.count(), 1)
+        self.assertEqual(self.cuenta.pedidos.get().pk, original_order_id)
+        self.assertEqual(CobroCuenta.objects.get(cuenta=self.cuenta).total_cobrado, Decimal("1200.00"))
+
+
+class CobroCuentaConcurrenteTests(TransactionTestCase):
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_cobro_concurrente_con_carga_no_agrega_pedido_a_cuenta_cerrada(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        mozo = User.objects.create_user(
+            username="cobro_concurrente",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=salon,
+        )
+        mesa = Mesa.objects.create(numero=131)
+        cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
+        categoria = Categoria.objects.create(nombre="Cobro concurrente")
+        producto = Producto.objects.create(
+            nombre="Producto concurrente",
+            precio=Decimal("100.00"),
+            categoria=categoria,
+            sector_destino=barra,
+        )
+        pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
+        DetallePedido.objects.create(pedido=pedido, producto=producto, cantidad=1)
+        barrier = Barrier(2)
+        results = {}
+        errors = []
+
+        def post(name, url, payload):
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=mozo.pk))
+                barrier.wait(timeout=5)
+                results[name] = client.post(url, payload, format="json")
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        payment_thread = Thread(
+            target=post,
+            args=(
+                "payment",
+                reverse("cuenta-cobrar", args=[cuenta.pk]),
+                {
+                    "clave_idempotencia": uuid4(),
+                    "total_esperado": "100.00",
+                    "importes": [{"medio": "EFECTIVO", "importe": "100.00"}],
+                },
+            ),
+        )
+        order_thread = Thread(
+            target=post,
+            args=(
+                "order",
+                reverse("pedido-mesa-create"),
+                {
+                    "mesa": mesa.pk,
+                    "detalles": [{"producto": producto.pk, "cantidad": 1}],
+                },
+            ),
+        )
+        payment_thread.start()
+        order_thread.start()
+        payment_thread.join(timeout=10)
+        order_thread.join(timeout=10)
+
+        self.assertFalse(payment_thread.is_alive())
+        self.assertFalse(order_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["order"].status_code, status.HTTP_201_CREATED)
+        cuenta.refresh_from_db()
+        if results["payment"].status_code == status.HTTP_201_CREATED:
+            self.assertEqual(cuenta.estado, Cuenta.Estado.CERRADA)
+            self.assertEqual(cuenta.pedidos.count(), 1)
+            self.assertEqual(
+                Cuenta.objects.filter(mesa=mesa, estado=Cuenta.Estado.ABIERTA).count(),
+                1,
+            )
+        else:
+            self.assertEqual(results["payment"].status_code, status.HTTP_409_CONFLICT)
+            self.assertEqual(cuenta.estado, Cuenta.Estado.ABIERTA)
+            self.assertEqual(cuenta.pedidos.count(), 2)
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_doble_envio_concurrente_devuelve_un_unico_cobro(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        mozo = User.objects.create_user(
+            username="cobro_duplicado_concurrente",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=salon,
+        )
+        mesa = Mesa.objects.create(numero=132)
+        cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
+        categoria = Categoria.objects.create(nombre="Cobro duplicado")
+        producto = Producto.objects.create(
+            nombre="Producto duplicado",
+            precio=Decimal("100.00"),
+            categoria=categoria,
+            sector_destino=barra,
+        )
+        pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
+        DetallePedido.objects.create(pedido=pedido, producto=producto, cantidad=1)
+        barrier = Barrier(2)
+        results = []
+        errors = []
+        key = uuid4()
+
+        def post_cobro():
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=mozo.pk))
+                barrier.wait(timeout=5)
+                results.append(
+                    client.post(
+                        reverse("cuenta-cobrar", args=[cuenta.pk]),
+                        {
+                            "clave_idempotencia": key,
+                            "total_esperado": "100.00",
+                            "importes": [
+                                {"medio": "EFECTIVO", "importe": "100.00"},
+                            ],
+                        },
+                        format="json",
+                    ),
+                )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        threads = [Thread(target=post_cobro) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(result.status_code for result in results), [200, 201])
+        self.assertEqual(CobroCuenta.objects.filter(cuenta=cuenta).count(), 1)
+        self.assertEqual(ImportePagoCuenta.objects.filter(cobro__cuenta=cuenta).count(), 1)
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_cobro_concurrente_con_resolucion_no_cierra_con_total_desactualizado(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        mozo = User.objects.create_user(
+            username="cobro_cancelacion_concurrente",
+            password="test-password",
+            rol=User.Rol.MOZO,
+            sector=salon,
+        )
+        usuario_barra = User.objects.create_user(
+            username="barra_cobro_concurrente",
+            password="test-password",
+            rol=User.Rol.BARRA,
+            sector=barra,
+        )
+        mesa = Mesa.objects.create(numero=133)
+        cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
+        categoria = Categoria.objects.create(nombre="Resolución concurrente")
+        producto = Producto.objects.create(
+            nombre="Producto resolución",
+            precio=Decimal("100.00"),
+            categoria=categoria,
+            sector_destino=barra,
+        )
+        pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
+        detalle = DetallePedido.objects.create(
+            pedido=pedido,
+            producto=producto,
+            cantidad=1,
+        )
+        solicitud = SolicitudCancelacionDetalle.objects.create(
+            detalle=detalle,
+            solicitante=mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Resolución concurrente",
+        )
+        barrier = Barrier(2)
+        results = {}
+        errors = []
+
+        def post(name, user, url, payload):
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=user.pk))
+                barrier.wait(timeout=5)
+                results[name] = client.post(url, payload, format="json")
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        payment_thread = Thread(
+            target=post,
+            args=(
+                "payment",
+                mozo,
+                reverse("cuenta-cobrar", args=[cuenta.pk]),
+                {
+                    "clave_idempotencia": uuid4(),
+                    "total_esperado": "100.00",
+                    "importes": [{"medio": "EFECTIVO", "importe": "100.00"}],
+                },
+            ),
+        )
+        resolution_thread = Thread(
+            target=post,
+            args=(
+                "resolution",
+                usuario_barra,
+                reverse("cancelacion-resolver", args=[solicitud.pk]),
+                {"estado": SolicitudCancelacionDetalle.Estado.ACEPTADA},
+            ),
+        )
+        payment_thread.start()
+        resolution_thread.start()
+        payment_thread.join(timeout=10)
+        resolution_thread.join(timeout=10)
+
+        self.assertFalse(payment_thread.is_alive())
+        self.assertFalse(resolution_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["payment"].status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(results["resolution"].status_code, status.HTTP_200_OK)
+        cuenta.refresh_from_db()
+        solicitud.refresh_from_db()
+        self.assertEqual(cuenta.estado, Cuenta.Estado.ABIERTA)
+        self.assertEqual(solicitud.estado, SolicitudCancelacionDetalle.Estado.ACEPTADA)
+        self.assertFalse(CobroCuenta.objects.filter(cuenta=cuenta).exists())

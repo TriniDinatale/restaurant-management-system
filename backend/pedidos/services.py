@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db.models import Exists, F, IntegerField, OuterRef, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 
@@ -38,6 +40,17 @@ def cantidad_vigente(detalle):
 
 def cantidad_disponible_cancelacion(detalle):
     return cantidades_cancelacion(detalle)["disponibles"]
+
+
+def total_vigente_cuenta(cuenta):
+    return sum(
+        (
+            detalle.precio_unitario * cantidad_vigente(detalle)
+            for pedido in cuenta.pedidos.all()
+            for detalle in pedido.detalles.all()
+        ),
+        Decimal("0.00"),
+    )
 
 
 def origen_entrega(detalle):

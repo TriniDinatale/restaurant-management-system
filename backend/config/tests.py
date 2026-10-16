@@ -68,14 +68,18 @@ class WebInterfaceAccessTests(TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertTemplateUsed(response, "usuarios/mesas.html")
                 self.assertContains(response, 'id="notification-toggle"')
-                self.assertContains(response, "Actualizar datos")
+                self.assertContains(response, "<h1>Mesas</h1>")
+                self.assertContains(response, 'id="loading-message"')
+                self.assertContains(response, 'id="zones"')
+                self.assertContains(response, 'id="account-overlay"')
                 if user.rol == User.Rol.BARRA:
                     self.assertContains(response, 'id="bar-retirements"')
+                    self.assertContains(response, 'id="bar-preparations"')
+                    self.assertContains(response, "Preparación de Barra")
                     self.assertContains(
                         response,
                         "Confirmá que recibiste y revisaste los productos",
                     )
-                    self.assertContains(response, "Solicitudes de cancelación")
                     cancellation_page = self.client.get(
                         reverse("web-cancelaciones")
                     )
