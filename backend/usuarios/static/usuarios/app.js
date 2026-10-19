@@ -3207,6 +3207,14 @@ function initializeOrderForm() {
         event.preventDefault();
         submitOrder();
     });
+    // Enter dentro de un campo no debe enviar el pedido ni el cobro por accidente.
+    for (const formId of ["order-form", "account-payment"]) {
+        document.getElementById(formId).addEventListener("keydown", (event) => {
+            if (event.key === "Enter" && event.target.tagName === "INPUT") {
+                event.preventDefault();
+            }
+        });
+    }
     document.getElementById("product-search").addEventListener("input", renderProductCatalog);
     document.getElementById("account-overlay").addEventListener("click", (event) => {
         if (event.target === event.currentTarget) closeAccountForm();

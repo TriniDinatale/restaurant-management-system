@@ -6,6 +6,7 @@ from django.db.models.functions import Coalesce
 from .models import (
     AvisoRetiro,
     DetallePedido,
+    PreparacionPedidoSector,
     Sector,
     SolicitudCancelacionDetalle,
 )
@@ -51,6 +52,58 @@ def total_vigente_cuenta(cuenta):
         ),
         Decimal("0.00"),
     )
+
+
+def productos_pendientes_para_cierre(cuenta):
+    """Describe los productos vigentes que impiden cobrar y cerrar la cuenta.
+
+    Un producto vigente está listo para el cierre cuando la preparación de su
+    sector en ese pedido está LISTO y existe el aviso de retiro de su origen
+    (barra lo habilita al marcar listo; cocina lo habilita Barra manualmente).
+    """
+    estados_preparacion = {
+        (prep.pedido_id, prep.sector_id): prep.estado
+        for prep in PreparacionPedidoSector.objects.filter(
+            pedido__cuenta=cuenta,
+        )
+    }
+    retiros_habilitados = set(
+        AvisoRetiro.objects.filter(
+            pedido__cuenta=cuenta,
+            origen__isnull=False,
+        ).values_list("pedido_id", "origen")
+    )
+    detalles = (
+        DetallePedido.objects.filter(pedido__cuenta=cuenta)
+        .select_related("producto", "sector_destino")
+        .prefetch_related("solicitudes_cancelacion")
+        .order_by("pedido_id", "pk")
+    )
+
+    pendientes = []
+    for detalle in detalles:
+        cantidad = cantidad_vigente(detalle)
+        if cantidad <= 0:
+            continue
+        estado = estados_preparacion.get(
+            (detalle.pedido_id, detalle.sector_destino_id),
+        )
+        origen = origen_entrega(detalle)
+        if estado != PreparacionPedidoSector.Estado.LISTO:
+            motivo = (
+                "en preparación"
+                if estado == PreparacionPedidoSector.Estado.EN_PREPARACION
+                else "pendiente de preparación"
+            )
+        elif origen is None or (detalle.pedido_id, origen) not in retiros_habilitados:
+            motivo = "listo, sin retiro habilitado por Barra"
+        else:
+            continue
+        pendientes.append(
+            f"Pedido {detalle.pedido_id}: {cantidad} x "
+            f"{detalle.producto.nombre} ({motivo})"
+        )
+    return pendientes
 
 
 def origen_entrega(detalle):

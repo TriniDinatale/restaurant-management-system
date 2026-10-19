@@ -36,6 +36,35 @@ from unittest.mock import PropertyMock, patch
 from django.db import IntegrityError
 from uuid import uuid4
 
+
+def preparar_pedido_para_cierre(pedido, estado=PreparacionPedidoSector.Estado.LISTO,
+                                habilitar_retiro=True):
+    """Deja la preparación de cada sector y el retiro como en el flujo real."""
+    sectores = {}
+    for detalle in pedido.detalles.select_related("sector_destino"):
+        sectores[detalle.sector_destino_id] = detalle.sector_destino
+    for sector in sectores.values():
+        PreparacionPedidoSector.objects.update_or_create(
+            pedido=pedido,
+            sector=sector,
+            defaults={"estado": estado},
+        )
+        if not habilitar_retiro:
+            continue
+        origen = (
+            AvisoRetiro.Origen.BARRA
+            if sector.nombre == Sector.Nombre.BARRA
+            else AvisoRetiro.Origen.COCINA
+        )
+        AvisoRetiro.objects.get_or_create(
+            pedido=pedido,
+            origen=origen,
+            defaults={
+                "destinatario": pedido.mozo,
+                "mensaje": f"{pedido.mesa.identificacion} — {origen}",
+            },
+        )
+
 class PedidoModelTests(TestCase):
     def setUp(self):
         self.salon = Sector.objects.create(
@@ -4682,6 +4711,7 @@ class CobrarCuentaAPITests(APITestCase):
             producto=self.producto,
             cantidad=1,
         )
+        preparar_pedido_para_cierre(self.pedido)
         self.url = reverse("cuenta-cobrar", args=[self.cuenta.pk])
 
     def pagar(self, *, total="1200.00", importes=None, clave=None):
@@ -4716,7 +4746,7 @@ class CobrarCuentaAPITests(APITestCase):
             [("EFECTIVO", Decimal("1200.00"))],
         )
 
-    def test_cobro_combinado_y_productos_no_entregados_son_admitidos(self):
+    def test_cobro_combinado_con_productos_listos_y_retiro_habilitado(self):
         response = self.pagar(
             importes=[
                 {"medio": "EFECTIVO", "importe": "500.00"},
@@ -4730,6 +4760,251 @@ class CobrarCuentaAPITests(APITestCase):
             CobroCuenta.objects.get(cuenta=self.cuenta).importes.count(),
             3,
         )
+
+    def assert_cobro_rechazado(self, response, texto=None):
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        if texto:
+            self.assertIn(texto, str(response.data["detail"]))
+        self.assertFalse(CobroCuenta.objects.exists())
+        self.assertFalse(ImportePagoCuenta.objects.exists())
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.ABIERTA)
+        self.assertIsNone(self.cuenta.fecha_cierre)
+
+    def crear_pedido_adicional(self, producto=None, cantidad=1):
+        pedido = Pedido.objects.create(
+            mesa=self.mesa,
+            cuenta=self.cuenta,
+            mozo=self.mozo,
+            creado_por=self.mozo,
+        )
+        detalle = DetallePedido.objects.create(
+            pedido=pedido,
+            producto=producto or self.producto,
+            cantidad=cantidad,
+        )
+        return pedido, detalle
+
+    def crear_producto_cocina(self, nombre="Pizza", precio="800.00"):
+        pizza = Sector.objects.get_or_create(nombre=Sector.Nombre.PIZZA)[0]
+        return Producto.objects.create(
+            nombre=nombre,
+            precio=Decimal(precio),
+            categoria=self.categoria,
+            sector_destino=pizza,
+        )
+
+    def test_producto_pendiente_impide_cobrar_y_cerrar(self):
+        preparar_pedido_para_cierre(
+            self.pedido,
+            estado=PreparacionPedidoSector.Estado.PENDIENTE,
+            habilitar_retiro=False,
+        )
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "pendiente de preparación")
+
+    def test_producto_en_preparacion_impide_cobrar_y_cerrar(self):
+        preparar_pedido_para_cierre(
+            self.pedido,
+            estado=PreparacionPedidoSector.Estado.EN_PREPARACION,
+            habilitar_retiro=False,
+        )
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "en preparación")
+
+    def test_producto_listo_sin_retiro_habilitado_impide_cobrar_y_cerrar(self):
+        AvisoRetiro.objects.filter(pedido=self.pedido).delete()
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "sin retiro habilitado")
+
+    def test_producto_en_preparacion_con_retiro_habilitado_impide_cobrar(self):
+        PreparacionPedidoSector.objects.filter(pedido=self.pedido).update(
+            estado=PreparacionPedidoSector.Estado.EN_PREPARACION,
+        )
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "en preparación")
+
+    def test_preparacion_inexistente_se_considera_pendiente(self):
+        PreparacionPedidoSector.objects.filter(pedido=self.pedido).delete()
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "pendiente de preparación")
+
+    def test_aviso_historico_sin_origen_no_habilita_retiro(self):
+        AvisoRetiro.objects.filter(pedido=self.pedido).update(origen=None)
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "sin retiro habilitado")
+
+    def test_producto_de_cocina_requiere_listo_y_retiro_habilitado_por_barra(self):
+        pizza = self.crear_producto_cocina()
+        pedido, _ = self.crear_pedido_adicional(pizza)
+        total = "2000.00"
+        importes = [{"medio": "EFECTIVO", "importe": total}]
+
+        preparar_pedido_para_cierre(
+            pedido,
+            estado=PreparacionPedidoSector.Estado.PENDIENTE,
+            habilitar_retiro=False,
+        )
+        self.assert_cobro_rechazado(
+            self.pagar(total=total, importes=importes),
+            "pendiente de preparación",
+        )
+
+        # Retiro de cocina habilitado manualmente, pero la cocina no terminó.
+        AvisoRetiro.objects.create(
+            pedido=pedido,
+            origen=AvisoRetiro.Origen.COCINA,
+            destinatario=self.mozo,
+            generado_por=self.usuario_barra,
+            mensaje="Cocina lista",
+        )
+        self.assert_cobro_rechazado(
+            self.pagar(total=total, importes=importes),
+            "pendiente de preparación",
+        )
+
+        PreparacionPedidoSector.objects.filter(pedido=pedido).update(
+            estado=PreparacionPedidoSector.Estado.LISTO,
+        )
+        response = self.pagar(total=total, importes=importes)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_aviso_de_barra_no_habilita_producto_de_cocina(self):
+        pizza = self.crear_producto_cocina()
+        pedido, _ = self.crear_pedido_adicional(pizza)
+        preparar_pedido_para_cierre(pedido)
+        AvisoRetiro.objects.filter(
+            pedido=pedido,
+            origen=AvisoRetiro.Origen.COCINA,
+        ).delete()
+
+        response = self.pagar(
+            total="2000.00",
+            importes=[{"medio": "EFECTIVO", "importe": "2000.00"}],
+        )
+
+        self.assert_cobro_rechazado(response, "sin retiro habilitado")
+
+    def test_varios_pedidos_todos_deben_estar_listos_y_habilitados(self):
+        segundo, _ = self.crear_pedido_adicional()
+        tercero, _ = self.crear_pedido_adicional()
+        preparar_pedido_para_cierre(segundo)
+        preparar_pedido_para_cierre(
+            tercero,
+            estado=PreparacionPedidoSector.Estado.EN_PREPARACION,
+            habilitar_retiro=False,
+        )
+        total = "3600.00"
+        importes = [{"medio": "EFECTIVO", "importe": total}]
+
+        response = self.pagar(total=total, importes=importes)
+
+        self.assert_cobro_rechazado(response, f"Pedido {tercero.pk}")
+        self.assertNotIn(f"Pedido {segundo.pk}:", str(response.data["detail"]))
+
+        preparar_pedido_para_cierre(tercero)
+        response = self.pagar(total=total, importes=importes)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.CERRADA)
+
+    def test_producto_totalmente_cancelado_no_bloquea_el_cierre(self):
+        pedido_pendiente, detalle = self.crear_pedido_adicional()
+        preparar_pedido_para_cierre(
+            pedido_pendiente,
+            estado=PreparacionPedidoSector.Estado.PENDIENTE,
+            habilitar_retiro=False,
+        )
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Cancelado antes de preparar",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.usuario_barra,
+            fecha_resolucion=timezone.now(),
+        )
+
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_cancelacion_parcial_aceptada_no_oculta_unidades_vigentes_pendientes(self):
+        pedido_pendiente, detalle = self.crear_pedido_adicional(cantidad=2)
+        preparar_pedido_para_cierre(
+            pedido_pendiente,
+            estado=PreparacionPedidoSector.Estado.PENDIENTE,
+            habilitar_retiro=False,
+        )
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Una unidad menos",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+            resuelto_por=self.usuario_barra,
+            fecha_resolucion=timezone.now(),
+        )
+
+        response = self.pagar(
+            total="2400.00",
+            importes=[{"medio": "EFECTIVO", "importe": "2400.00"}],
+        )
+
+        self.assert_cobro_rechazado(response, "1 x Producto de cobro")
+
+    def test_cancelacion_pendiente_sigue_bloqueando_aunque_todo_este_listo(self):
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=self.detalle,
+            solicitante=self.mozo,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="Pendiente de resolver",
+        )
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "solicitudes de cancelación pendientes")
+
+    def test_cuenta_sin_pedidos_cierra_con_total_cero(self):
+        self.pedido.detalles.all().delete()
+        self.pedido.delete()
+
+        response = self.pagar(total="0.00", importes=[])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.cuenta.refresh_from_db()
+        self.assertEqual(self.cuenta.estado, Cuenta.Estado.CERRADA)
+
+    def test_rechazo_por_pendientes_permite_cobrar_luego_con_nueva_clave(self):
+        PreparacionPedidoSector.objects.filter(pedido=self.pedido).update(
+            estado=PreparacionPedidoSector.Estado.EN_PREPARACION,
+        )
+        self.assert_cobro_rechazado(self.pagar())
+
+        PreparacionPedidoSector.objects.filter(pedido=self.pedido).update(
+            estado=PreparacionPedidoSector.Estado.LISTO,
+        )
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(CobroCuenta.objects.count(), 1)
 
     def test_cobro_usa_cantidad_vigente_y_conserva_cancelaciones(self):
         self.detalle.cantidad = 2
@@ -4963,6 +5238,7 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
         )
         pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
         DetallePedido.objects.create(pedido=pedido, producto=producto, cantidad=1)
+        preparar_pedido_para_cierre(pedido)
         barrier = Barrier(2)
         results = {}
         errors = []
@@ -5045,6 +5321,7 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
         )
         pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
         DetallePedido.objects.create(pedido=pedido, producto=producto, cantidad=1)
+        preparar_pedido_para_cierre(pedido)
         barrier = Barrier(2)
         results = []
         errors = []
@@ -5117,6 +5394,7 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
             producto=producto,
             cantidad=1,
         )
+        preparar_pedido_para_cierre(pedido)
         solicitud = SolicitudCancelacionDetalle.objects.create(
             detalle=detalle,
             solicitante=mozo,

@@ -54,6 +54,7 @@ from .services import (
     detalles_vigentes_exist,
     detalles_vigentes_de_sector,
     estado_entrega,
+    productos_pendientes_para_cierre,
     total_vigente_cuenta,
 )
 
@@ -254,6 +255,16 @@ class CobrarCuentaView(generics.GenericAPIView):
                     raise CuentaCobroConflict(
                         "No se puede cerrar la cuenta mientras haya "
                         "solicitudes de cancelación pendientes."
+                    )
+
+                pendientes = productos_pendientes_para_cierre(cuenta)
+                if pendientes:
+                    raise CuentaCobroConflict(
+                        "No se puede cobrar y cerrar la cuenta: todos los "
+                        "productos vigentes deben estar listos y con retiro "
+                        "habilitado por Barra. Pendientes: "
+                        + "; ".join(pendientes[:5])
+                        + ("; …" if len(pendientes) > 5 else ".")
                     )
 
                 total_actual = total_vigente_cuenta(cuenta)
