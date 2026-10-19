@@ -104,20 +104,52 @@ class WebInterfaceAccessTests(TestCase):
                     reverse("web-mesas"),
                 )
 
-    def test_administrator_keeps_pending_screen(self):
+    def test_administrator_is_routed_to_admin_panel(self):
         self.client.force_login(self.admin)
         self.assertRedirects(
             self.client.get(reverse("web-home")),
-            reverse("web-pendiente"),
+            reverse("web-admin"),
         )
-        response = self.client.get(reverse("web-pendiente"))
+        response = self.client.get(reverse("web-admin"))
         self.assertEqual(response.status_code, 200)
-        self.assertTemplateUsed(response, "usuarios/pendiente.html")
-        self.assertContains(response, "pantalla operativa está pendiente")
-        self.assertContains(response, "Cerrar sesión")
+        self.assertTemplateUsed(response, "usuarios/admin_panel.html")
+        self.assertContains(response, "Panel de administración")
+        self.assertContains(response, 'id="user-label"')
+        self.assertContains(response, 'id="logout-button"')
+        for section in [
+            "Ventas y cobros",
+            "Ventas por mozo",
+            "Caja y turnos",
+            "Productos y categorías",
+            "Registro de operaciones de barra",
+        ]:
+            self.assertContains(response, section)
+        self.assertContains(response, "Pendiente", count=5)
+        for url in [reverse("web-mesas"), reverse("web-pendiente")]:
+            with self.subTest(url=url):
+                self.assertRedirects(
+                    self.client.get(url),
+                    reverse("web-admin"),
+                )
+
+    def test_other_roles_cannot_access_admin_panel(self):
+        expected = {
+            self.mozo: reverse("web-mesas"),
+            self.barra_user: reverse("web-mesas"),
+            self.cocina: reverse("web-pendiente"),
+        }
+        for user, destination in expected.items():
+            with self.subTest(role=user.rol):
+                self.client.force_login(user)
+                self.assertRedirects(
+                    self.client.get(reverse("web-admin")),
+                    destination,
+                )
+
+    def test_anonymous_user_cannot_access_admin_panel(self):
         self.assertRedirects(
-            self.client.get(reverse("web-mesas")),
-            reverse("web-pendiente"),
+            self.client.get(reverse("web-admin")),
+            reverse("web-home"),
         )
 
     def test_kitchen_cannot_access_cancellation_screen(self):

@@ -1,0 +1,59 @@
+{% extends "usuarios/base.html" %}
+{% block title %}Panel de administración · Gestión del restaurante{% endblock %}
+{% block page_name %}admin{% endblock %}
+{% block content %}
+<header class="topbar">
+    <a class="brand" href="/" aria-label="Gestión del restaurante, inicio">
+        <span class="brand-mark brand-mark-small" aria-hidden="true">R</span>
+        <span>Restaurante</span>
+    </a>
+    <div class="user-tools">
+        <span id="user-label" class="user-label">Cargando usuario…</span>
+        <button id="logout-button" class="button button-quiet" type="button">
+            Cerrar sesión
+        </button>
+    </div>
+</header>
+<main class="page-shell">
+    <section class="page-heading">
+        <div>
+            <p class="eyebrow">ADMINISTRACIÓN</p>
+            <h1>Panel de administración</h1>
+            <p class="intro">
+                Secciones del módulo de administración. Las que aún no tienen
+                funcionalidad figuran como pendientes.
+            </p>
+        </div>
+    </section>
+    <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
+    <nav aria-label="Secciones de administración">
+        <ul class="admin-sections">
+            <li class="admin-section" id="admin-ventas-cobros">
+                <h2>Ventas y cobros</h2>
+                <p>Consulta de cobros por fecha y medio de pago.</p>
+                <span class="admin-status">Pendiente</span>
+            </li>
+            <li class="admin-section" id="admin-ventas-mozo">
+                <h2>Ventas por mozo</h2>
+                <p>Importes cobrados por cada mozo.</p>
+                <span class="admin-status">Pendiente</span>
+            </li>
+            <li class="admin-section" id="admin-caja-turnos">
+                <h2>Caja y turnos</h2>
+                <p>Apertura y cierre de turnos, movimientos de caja y pagos a proveedores.</p>
+                <span class="admin-status">Pendiente</span>
+            </li>
+            <li class="admin-section" id="admin-productos-categorias">
+                <h2>Productos y categorías</h2>
+                <p>Administración del catálogo de productos y sus categorías.</p>
+                <span class="admin-status">Pendiente</span>
+            </li>
+            <li class="admin-section" id="admin-registro-barra">
+                <h2>Registro de operaciones de barra</h2>
+                <p>Productos cargados por Barra en cuentas de mozos.</p>
+                <span class="admin-status">Pendiente</span>
+            </li>
+        </ul>
+    </nav>
+</main>
+{% endblock %}

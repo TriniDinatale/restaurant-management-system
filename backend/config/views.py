@@ -11,6 +11,8 @@ def _can_review_cancellations(user):
 def _role_home(user):
     if user.rol in {User.Rol.MOZO, User.Rol.BARRA}:
         return "web-mesas"
+    if user.rol == User.Rol.ADMINISTRADOR:
+        return "web-admin"
     return "web-pendiente"
 
 
@@ -31,9 +33,17 @@ def web_mesas(request):
 def web_pendiente(request):
     if not request.user.is_authenticated:
         return redirect("web-home")
-    if request.user.rol in {User.Rol.MOZO, User.Rol.BARRA}:
-        return redirect("web-mesas")
+    if request.user.rol != User.Rol.COCINA:
+        return redirect(_role_home(request.user))
     return render(request, "usuarios/pendiente.html")
+
+
+def web_admin(request):
+    if not request.user.is_authenticated:
+        return redirect("web-home")
+    if request.user.rol != User.Rol.ADMINISTRADOR:
+        return redirect(_role_home(request.user))
+    return render(request, "usuarios/admin_panel.html")
 
 
 def web_cancelaciones(request):

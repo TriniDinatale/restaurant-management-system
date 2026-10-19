@@ -2,7 +2,13 @@ from django.contrib import admin
 from django.http import JsonResponse
 from django.urls import include, path
 
-from .views import web_cancelaciones, web_home, web_mesas, web_pendiente
+from .views import (
+    web_admin,
+    web_cancelaciones,
+    web_home,
+    web_mesas,
+    web_pendiente,
+)
 
 
 def health_check(request):
@@ -14,6 +20,7 @@ urlpatterns = [
     path("mesas/", web_mesas, name="web-mesas"),
     path("pendiente/", web_pendiente, name="web-pendiente"),
     path("cancelaciones/", web_cancelaciones, name="web-cancelaciones"),
+    path("panel-admin/", web_admin, name="web-admin"),
     path("admin/", admin.site.urls),
     path("health/", health_check, name="health-check"),
     path("api/usuarios/", include("usuarios.urls")),

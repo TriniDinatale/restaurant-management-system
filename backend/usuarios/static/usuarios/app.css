@@ -534,6 +534,42 @@ h2 {
     margin-top: 0;
 }
 
+.admin-sections {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+    gap: 16px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.admin-section {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 22px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: var(--surface);
+}
+
+.admin-section p {
+    margin-bottom: 0;
+    color: var(--muted);
+    line-height: 1.5;
+}
+
+.admin-status {
+    margin-top: auto;
+    padding: 4px 10px;
+    border: 1px solid var(--warning-border);
+    border-radius: 999px;
+    background: var(--warning-bg);
+    font-size: 0.78rem;
+    font-weight: 800;
+}
+
 .account-overlay,
 .order-overlay,
 .cancellation-overlay {
