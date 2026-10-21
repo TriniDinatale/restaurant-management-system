@@ -1,4 +1,4 @@
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from usuarios.models import Sector, User
@@ -169,3 +169,63 @@ class WebInterfaceAccessTests(TestCase):
             self.client.get(reverse("web-cancelaciones")),
             reverse("web-pendiente"),
         )
+
+
+class StaticAssetVersionTests(TestCase):
+    def test_login_page_includes_static_version_in_asset_urls(self):
+        from django.conf import settings
+
+        response = self.client.get(reverse("web-home"))
+
+        version = settings.STATIC_ASSET_VERSION
+        self.assertTrue(version)
+        self.assertContains(response, f"usuarios/app.js?v={version}")
+        self.assertContains(response, f"usuarios/app.css?v={version}")
+
+    @override_settings(STATIC_ASSET_VERSION="2099.01.01-9")
+    def test_asset_urls_follow_the_configured_version(self):
+        response = self.client.get(reverse("web-home"))
+
+        self.assertContains(response, "usuarios/app.js?v=2099.01.01-9")
+        self.assertContains(response, "usuarios/app.css?v=2099.01.01-9")
+
+
+class ShiftPanelWebTests(TestCase):
+    def setUp(self):
+        self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        self.barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.pizza = Sector.objects.create(nombre=Sector.Nombre.PIZZA)
+        self.barra_user = User.objects.create_user(
+            username="t_barra", password="x-test-pass-1", rol=User.Rol.BARRA,
+            sector=self.barra,
+        )
+        self.barra_otro_sector = User.objects.create_user(
+            username="t_barra_otro", password="x-test-pass-1",
+            rol=User.Rol.BARRA, sector=self.salon,
+        )
+        self.mozo = User.objects.create_user(
+            username="t_mozo", password="x-test-pass-1", rol=User.Rol.MOZO,
+            sector=self.salon,
+        )
+
+    def test_panel_only_for_barra_sector(self):
+        self.client.force_login(self.barra_user)
+        response = self.client.get(reverse("web-mesas"))
+        for fragment in [
+            'id="shift-panel"',
+            'id="shift-open-form"',
+            'value="TURNO_1"',
+            'value="TURNO_2"',
+            'id="shift-amount"',
+            "Abrir turno",
+        ]:
+            self.assertContains(response, fragment)
+        self.assertNotContains(response, "Cerrar turno")
+
+        for user in [self.mozo, self.barra_otro_sector]:
+            with self.subTest(user=user.username):
+                self.client.force_login(user)
+                response = self.client.get(reverse("web-mesas"))
+                self.assertEqual(response.status_code, 200)
+                self.assertNotContains(response, 'id="shift-panel"')
+                self.assertNotContains(response, 'id="shift-open-form"')

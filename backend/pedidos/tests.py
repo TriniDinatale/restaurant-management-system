@@ -7,6 +7,7 @@ import time
 
 from django.core.exceptions import ValidationError
 from django.db import close_old_connections, connection, transaction
+from django.db.models import ProtectedError
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 from django.utils import timezone
@@ -26,6 +27,7 @@ from .models import (
     Pedido,
     PreparacionPedidoSector,
     SolicitudCancelacionDetalle,
+    Turno,
 )
 
 from django.urls import reverse
@@ -4407,7 +4409,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             for order in consumo.data["pedidos"]
             for detail in order["detalles"]
         }
-        self.assertEqual(detalles[self.producto.pk]["estado_entrega"], "ENTREGADO")
+        self.assertEqual(detalles[self.producto.pk]["estado_entrega"], "RETIRO_HABILITADO")
         self.assertFalse(
             detalles[self.producto.pk]["puede_solicitar_cancelacion"],
         )
@@ -4435,7 +4437,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         }
         self.assertEqual(
             details_after_read[self.producto.pk],
-            "ENTREGADO",
+            "RETIRO_HABILITADO",
         )
 
         AvisoRetiro.objects.create(
@@ -4452,7 +4454,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
         }
         for sector in [self.pizza, self.platos]:
             detail = detalles[productos_por_sector[sector.nombre].pk]
-            self.assertEqual(detail["estado_entrega"], "ENTREGADO")
+            self.assertEqual(detail["estado_entrega"], "RETIRO_HABILITADO")
             self.assertFalse(detail["puede_solicitar_cancelacion"])
 
     def test_aviso_historico_sin_origen_no_atribuye_entrega(self):
@@ -4495,7 +4497,7 @@ class SolicitudCancelacionDetalleAPITests(APITestCase):
             1,
         )
         detail = self.consultar_consumo().data["pedidos"][0]["detalles"][0]
-        self.assertEqual(detail["estado_entrega"], "ENTREGADO")
+        self.assertEqual(detail["estado_entrega"], "RETIRO_HABILITADO")
         self.assertEqual(detail["cantidad_pendiente"], 1)
         self.assertEqual(detail["cantidad_disponible_cancelacion"], 0)
 
@@ -4666,6 +4668,21 @@ class AvisoCancelacionConcurrenteTests(TransactionTestCase):
         )
 
 
+def abrir_turno_de_prueba(sector_barra, tipo=None):
+    usuario = User.objects.create_user(
+        username=f"turno_helper_{uuid4().hex[:8]}",
+        password=uuid4().hex,
+        rol=User.Rol.BARRA,
+        sector=sector_barra,
+    )
+    return Turno.objects.create(
+        tipo_turno=tipo or Turno.Tipo.TURNO_2,
+        abierto_por=usuario,
+        importe_inicial_caja=Decimal("0.00"),
+        clave_idempotencia=uuid4(),
+    )
+
+
 class CobrarCuentaAPITests(APITestCase):
     def setUp(self):
         self.salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
@@ -4712,21 +4729,142 @@ class CobrarCuentaAPITests(APITestCase):
             cantidad=1,
         )
         preparar_pedido_para_cierre(self.pedido)
+        self.turno = abrir_turno_de_prueba(self.barra)
         self.url = reverse("cuenta-cobrar", args=[self.cuenta.pk])
 
-    def pagar(self, *, total="1200.00", importes=None, clave=None):
-        self.client.force_authenticate(user=self.mozo)
-        return self.client.post(
-            self.url,
-            {
-                "clave_idempotencia": clave or uuid4(),
-                "total_esperado": total,
-                "importes": importes if importes is not None else [
-                    {"medio": "EFECTIVO", "importe": "1200.00"},
-                ],
-            },
-            format="json",
+    def cerrar_turno(self):
+        Turno.objects.filter(pk=self.turno.pk).update(
+            estado=Turno.Estado.CERRADO,
+            fecha_cierre=timezone.now() + timedelta(seconds=1),
+            cerrado_por=self.usuario_barra,
         )
+
+    def pagar(self, *, total="1200.00", importes=None, clave=None, extra=None):
+        self.client.force_authenticate(user=self.mozo)
+        datos = {
+            "clave_idempotencia": clave or uuid4(),
+            "total_esperado": total,
+            "importes": importes if importes is not None else [
+                {"medio": "EFECTIVO", "importe": "1200.00"},
+            ],
+        }
+        datos.update(extra or {})
+        return self.client.post(self.url, datos, format="json")
+
+    def test_cobro_nuevo_se_asocia_al_turno_abierto(self):
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["turno"], self.turno.pk)
+        self.assertEqual(
+            CobroCuenta.objects.get(cuenta=self.cuenta).turno,
+            self.turno,
+        )
+
+    def test_cobro_combinado_con_turno_registra_importes_por_medio(self):
+        response = self.pagar(
+            importes=[
+                {"medio": "EFECTIVO", "importe": "500.00"},
+                {"medio": "TRANSFERENCIA", "importe": "400.00"},
+                {"medio": "TARJETA", "importe": "300.00"},
+            ],
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        cobro = CobroCuenta.objects.get(cuenta=self.cuenta)
+        self.assertEqual(cobro.turno, self.turno)
+        self.assertEqual(
+            dict(cobro.importes.values_list("medio", "importe")),
+            {
+                "EFECTIVO": Decimal("500.00"),
+                "TRANSFERENCIA": Decimal("400.00"),
+                "TARJETA": Decimal("300.00"),
+            },
+        )
+
+    def test_sin_turno_abierto_rechaza_sin_crear_nada(self):
+        Turno.objects.all().delete()
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(
+            response,
+            "No hay un turno abierto. Solicitá a Barra que abra el turno "
+            "antes de cobrar.",
+        )
+
+    def test_turno_cerrado_no_sirve_para_un_cobro_nuevo(self):
+        self.cerrar_turno()
+
+        response = self.pagar()
+
+        self.assert_cobro_rechazado(response, "No hay un turno abierto")
+
+    def test_reintento_idempotente_funciona_con_turno_cerrado(self):
+        clave = uuid4()
+        primero = self.pagar(clave=clave)
+        self.assertEqual(primero.status_code, status.HTTP_201_CREATED)
+        self.cerrar_turno()
+
+        reintento = self.pagar(clave=clave)
+
+        self.assertEqual(reintento.status_code, status.HTTP_200_OK)
+        self.assertEqual(reintento.data["id"], primero.data["id"])
+        self.assertEqual(reintento.data["turno"], self.turno.pk)
+        self.assertEqual(CobroCuenta.objects.count(), 1)
+
+    def test_cliente_no_puede_elegir_el_turno(self):
+        otro = Turno.objects.create(
+            tipo_turno=Turno.Tipo.TURNO_1,
+            abierto_por=self.usuario_barra,
+            importe_inicial_caja=Decimal("0.00"),
+            clave_idempotencia=uuid4(),
+            estado=Turno.Estado.CERRADO,
+            fecha_apertura=timezone.now() - timedelta(hours=5),
+            fecha_cierre=timezone.now() - timedelta(hours=1),
+            cerrado_por=self.usuario_barra,
+        )
+
+        response = self.pagar(extra={"turno": otro.pk})
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["turno"], self.turno.pk)
+        self.assertEqual(
+            CobroCuenta.objects.get(cuenta=self.cuenta).turno,
+            self.turno,
+        )
+
+    def test_validaciones_previas_tienen_prioridad_sobre_el_turno(self):
+        Turno.objects.all().delete()
+
+        response = self.pagar(
+            importes=[{"medio": "EFECTIVO", "importe": "1.00"}],
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(CobroCuenta.objects.exists())
+
+    def test_cobro_historico_sin_turno_sigue_siendo_valido(self):
+        mesa = Mesa.objects.create(numero=199)
+        cuenta = Cuenta.objects.create(
+            mesa=mesa,
+            mozo_responsable=self.mozo,
+            estado=Cuenta.Estado.CERRADA,
+        )
+        historico = CobroCuenta.objects.create(
+            cuenta=cuenta,
+            mozo=self.mozo,
+            total_cobrado=Decimal("0.00"),
+            total_esperado=Decimal("0.00"),
+            clave_idempotencia=uuid4(),
+        )
+
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        historico.refresh_from_db()
+        self.assertIsNone(historico.turno)
+        self.assertEqual(CobroCuenta.objects.filter(turno__isnull=True).count(), 1)
 
     def test_cobro_con_un_medio_conserva_historial_y_cierra(self):
         response = self.pagar()
@@ -4846,7 +4984,7 @@ class CobrarCuentaAPITests(APITestCase):
 
         self.assert_cobro_rechazado(response, "sin retiro habilitado")
 
-    def test_producto_de_cocina_requiere_listo_y_retiro_habilitado_por_barra(self):
+    def test_producto_de_cocina_se_habilita_solo_con_retiro_confirmado_por_barra(self):
         pizza = self.crear_producto_cocina()
         pedido, _ = self.crear_pedido_adicional(pizza)
         total = "2000.00"
@@ -4859,10 +4997,10 @@ class CobrarCuentaAPITests(APITestCase):
         )
         self.assert_cobro_rechazado(
             self.pagar(total=total, importes=importes),
-            "pendiente de preparación",
+            "sin retiro habilitado",
         )
 
-        # Retiro de cocina habilitado manualmente, pero la cocina no terminó.
+        # Cocina no usa pantalla: Barra confirma el retiro y eso alcanza.
         AvisoRetiro.objects.create(
             pedido=pedido,
             origen=AvisoRetiro.Origen.COCINA,
@@ -4870,18 +5008,106 @@ class CobrarCuentaAPITests(APITestCase):
             generado_por=self.usuario_barra,
             mensaje="Cocina lista",
         )
-        self.assert_cobro_rechazado(
-            self.pagar(total=total, importes=importes),
-            "pendiente de preparación",
-        )
-
-        PreparacionPedidoSector.objects.filter(pedido=pedido).update(
-            estado=PreparacionPedidoSector.Estado.LISTO,
+        self.assertEqual(
+            PreparacionPedidoSector.objects.get(
+                pedido=pedido,
+                sector__nombre=Sector.Nombre.PIZZA,
+            ).estado,
+            PreparacionPedidoSector.Estado.PENDIENTE,
         )
         response = self.pagar(total=total, importes=importes)
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(AvisoRetiro.objects.filter(pedido=pedido).count(), 1)
 
+    def test_pedido_mixto_valida_cada_origen_de_forma_independiente(self):
+        pizza = self.crear_producto_cocina()
+        pedido, _ = self.crear_pedido_adicional(pizza)
+        PreparacionPedidoSector.objects.update_or_create(
+            pedido=pedido,
+            sector=pizza.sector_destino,
+            defaults={"estado": PreparacionPedidoSector.Estado.PENDIENTE},
+        )
+        # Barra del pedido mixto: con producto de barra en preparación.
+        detalle_barra = DetallePedido.objects.create(
+            pedido=pedido,
+            producto=self.producto,
+            cantidad=1,
+        )
+        PreparacionPedidoSector.objects.update_or_create(
+            pedido=pedido,
+            sector=self.barra,
+            defaults={"estado": PreparacionPedidoSector.Estado.EN_PREPARACION},
+        )
+        AvisoRetiro.objects.create(
+            pedido=pedido,
+            origen=AvisoRetiro.Origen.COCINA,
+            destinatario=self.mozo,
+            generado_por=self.usuario_barra,
+            mensaje="Cocina lista",
+        )
+        total = "3200.00"
+        importes = [{"medio": "EFECTIVO", "importe": total}]
+
+        response = self.pagar(total=total, importes=importes)
+
+        self.assert_cobro_rechazado(response, "en preparación")
+        self.assertIn("Producto de cobro", str(response.data["detail"]))
+        self.assertNotIn("Pizza", str(response.data["detail"]))
+
+        PreparacionPedidoSector.objects.filter(
+            pedido=pedido,
+            sector=self.barra,
+        ).update(estado=PreparacionPedidoSector.Estado.LISTO)
+        response = self.pagar(total=total, importes=importes)
+        self.assert_cobro_rechazado(response, "listo, sin retiro habilitado")
+
+        AvisoRetiro.objects.create(
+            pedido=pedido,
+            origen=AvisoRetiro.Origen.BARRA,
+            destinatario=self.mozo,
+            mensaje="Barra lista",
+        )
+        response = self.pagar(total=total, importes=importes)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNotNone(detalle_barra.pk)
+
+    def test_retiro_de_cocina_no_habilita_producto_de_barra_pendiente(self):
+        PreparacionPedidoSector.objects.filter(pedido=self.pedido).update(
+            estado=PreparacionPedidoSector.Estado.PENDIENTE,
+        )
+        AvisoRetiro.objects.filter(pedido=self.pedido).delete()
+        AvisoRetiro.objects.create(
+            pedido=self.pedido,
+            origen=AvisoRetiro.Origen.COCINA,
+            destinatario=self.mozo,
+            generado_por=self.usuario_barra,
+            mensaje="Cocina lista",
+        )
+
+        self.assert_cobro_rechazado(self.pagar(), "pendiente de preparación")
+
+    def test_cocina_con_retiro_cancelada_totalmente_no_bloquea(self):
+        pizza = self.crear_producto_cocina()
+        pedido, detalle = self.crear_pedido_adicional(pizza)
+        preparar_pedido_para_cierre(
+            pedido,
+            estado=PreparacionPedidoSector.Estado.PENDIENTE,
+            habilitar_retiro=False,
+        )
+        SolicitudCancelacionDetalle.objects.create(
+            detalle=detalle,
+            solicitante=self.mozo,
+            resuelto_por=self.usuario_barra,
+            clave_idempotencia=uuid4(),
+            cantidad=1,
+            motivo="x",
+            estado=SolicitudCancelacionDetalle.Estado.ACEPTADA,
+        )
+
+        response = self.pagar()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
     def test_aviso_de_barra_no_habilita_producto_de_cocina(self):
         pizza = self.crear_producto_cocina()
         pedido, _ = self.crear_pedido_adicional(pizza)
@@ -5227,6 +5453,7 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
             rol=User.Rol.MOZO,
             sector=salon,
         )
+        abrir_turno_de_prueba(barra)
         mesa = Mesa.objects.create(numero=131)
         cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
         categoria = Categoria.objects.create(nombre="Cobro concurrente")
@@ -5310,6 +5537,7 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
             rol=User.Rol.MOZO,
             sector=salon,
         )
+        abrir_turno_de_prueba(barra)
         mesa = Mesa.objects.create(numero=132)
         cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
         categoria = Categoria.objects.create(nombre="Cobro duplicado")
@@ -5362,6 +5590,153 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
         self.assertEqual(sorted(result.status_code for result in results), [200, 201])
         self.assertEqual(CobroCuenta.objects.filter(cuenta=cuenta).count(), 1)
         self.assertEqual(ImportePagoCuenta.objects.filter(cobro__cuenta=cuenta).count(), 1)
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_cobro_espera_al_cierre_concurrente_del_turno_y_es_rechazado(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        mozo = User.objects.create_user(
+            username="cobro_vs_cierre",
+            password=uuid4().hex,
+            rol=User.Rol.MOZO,
+            sector=salon,
+        )
+        turno = abrir_turno_de_prueba(barra)
+        mesa = Mesa.objects.create(numero=134)
+        cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
+        categoria = Categoria.objects.create(nombre="Cobro vs cierre")
+        producto = Producto.objects.create(
+            nombre="Producto vs cierre",
+            precio=Decimal("100.00"),
+            categoria=categoria,
+            sector_destino=barra,
+        )
+        pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
+        DetallePedido.objects.create(pedido=pedido, producto=producto, cantidad=1)
+        preparar_pedido_para_cierre(pedido)
+        lock_taken = Event()
+        results = {}
+        errors = []
+
+        def closer():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    Turno.objects.select_for_update().get(pk=turno.pk)
+                    lock_taken.set()
+                    time.sleep(1.5)
+                    Turno.objects.filter(pk=turno.pk).update(
+                        estado=Turno.Estado.CERRADO,
+                        fecha_cierre=timezone.now() + timedelta(seconds=1),
+                        cerrado_por=turno.abierto_por,
+                    )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        def payer():
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=mozo.pk))
+                lock_taken.wait(timeout=5)
+                results["payment"] = client.post(
+                    reverse("cuenta-cobrar", args=[cuenta.pk]),
+                    {
+                        "clave_idempotencia": uuid4(),
+                        "total_esperado": "100.00",
+                        "importes": [{"medio": "EFECTIVO", "importe": "100.00"}],
+                    },
+                    format="json",
+                )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        threads = [Thread(target=closer), Thread(target=payer)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(results["payment"].status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("No hay un turno abierto", str(results["payment"].data["detail"]))
+        cuenta.refresh_from_db()
+        self.assertEqual(cuenta.estado, Cuenta.Estado.ABIERTA)
+        self.assertFalse(CobroCuenta.objects.exists())
+        self.assertFalse(ImportePagoCuenta.objects.exists())
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_cobros_concurrentes_de_cuentas_distintas_usan_el_mismo_turno(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        turno = abrir_turno_de_prueba(barra)
+        categoria = Categoria.objects.create(nombre="Cobros paralelos")
+        producto = Producto.objects.create(
+            nombre="Producto paralelo",
+            precio=Decimal("100.00"),
+            categoria=categoria,
+            sector_destino=barra,
+        )
+        cuentas = []
+        for indice in range(2):
+            mozo = User.objects.create_user(
+                username=f"cobro_paralelo_{indice}",
+                password=uuid4().hex,
+                rol=User.Rol.MOZO,
+                sector=salon,
+            )
+            mesa = Mesa.objects.create(numero=135 + indice)
+            cuenta = Cuenta.objects.create(mesa=mesa, mozo_responsable=mozo)
+            pedido = Pedido.objects.create(mesa=mesa, cuenta=cuenta, mozo=mozo)
+            DetallePedido.objects.create(
+                pedido=pedido,
+                producto=producto,
+                cantidad=1,
+            )
+            preparar_pedido_para_cierre(pedido)
+            cuentas.append((cuenta, mozo))
+        barrier = Barrier(2)
+        results = []
+        errors = []
+
+        def pagar(cuenta, mozo):
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=mozo.pk))
+                barrier.wait(timeout=5)
+                results.append(
+                    client.post(
+                        reverse("cuenta-cobrar", args=[cuenta.pk]),
+                        {
+                            "clave_idempotencia": uuid4(),
+                            "total_esperado": "100.00",
+                            "importes": [{"medio": "TARJETA", "importe": "100.00"}],
+                        },
+                        format="json",
+                    ),
+                )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        threads = [Thread(target=pagar, args=pair) for pair in cuentas]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual([r.status_code for r in results], [201, 201])
+        self.assertEqual(turno.cobros.count(), 2)
+        self.assertEqual(CobroCuenta.objects.filter(turno__isnull=True).count(), 0)
 
     @skipUnlessDBFeature("has_select_for_update")
     def test_cobro_concurrente_con_resolucion_no_cierra_con_total_desactualizado(self):
@@ -5455,3 +5830,710 @@ class CobroCuentaConcurrenteTests(TransactionTestCase):
         self.assertEqual(cuenta.estado, Cuenta.Estado.ABIERTA)
         self.assertEqual(solicitud.estado, SolicitudCancelacionDetalle.Estado.ACEPTADA)
         self.assertFalse(CobroCuenta.objects.filter(cuenta=cuenta).exists())
+
+
+class TurnoModelTests(TestCase):
+    def setUp(self):
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.barra_user = User.objects.create_user(
+            username="turno_barra",
+            password="x",
+            rol=User.Rol.BARRA,
+            sector=barra,
+        )
+
+    def crear_turno(self, tipo=Turno.Tipo.TURNO_1, importe="0.00", **extra):
+        extra.setdefault("clave_idempotencia", uuid4())
+        return Turno.objects.create(
+            tipo_turno=tipo,
+            abierto_por=self.barra_user,
+            importe_inicial_caja=Decimal(importe),
+            **extra,
+        )
+
+    def cerrar(self, turno):
+        turno.estado = Turno.Estado.CERRADO
+        turno.fecha_cierre = timezone.now()
+        turno.cerrado_por = self.barra_user
+        turno.save()
+
+    def test_turno_1_con_caja_inicial_cero(self):
+        turno = self.crear_turno(Turno.Tipo.TURNO_1, "0.00")
+
+        turno.full_clean()
+        self.assertEqual(turno.estado, Turno.Estado.ABIERTO)
+        self.assertEqual(turno.importe_inicial_caja, Decimal("0.00"))
+        self.assertIsNone(turno.fecha_cierre)
+        self.assertIsNone(turno.cerrado_por)
+
+    def test_turno_2_con_caja_inicial_valida(self):
+        turno = self.crear_turno(Turno.Tipo.TURNO_2, "15000.50")
+
+        turno.full_clean()
+        turno.refresh_from_db()
+        self.assertEqual(turno.tipo_turno, Turno.Tipo.TURNO_2)
+        self.assertEqual(turno.importe_inicial_caja, Decimal("15000.50"))
+
+    def test_rechaza_caja_inicial_negativa_en_validacion(self):
+        turno = Turno(
+            tipo_turno=Turno.Tipo.TURNO_1,
+            abierto_por=self.barra_user,
+            importe_inicial_caja=Decimal("-1.00"),
+            clave_idempotencia=uuid4(),
+        )
+
+        with self.assertRaises(ValidationError) as contexto:
+            turno.full_clean()
+        self.assertIn("importe_inicial_caja", contexto.exception.message_dict)
+
+    def test_rechaza_tipo_invalido_en_validacion(self):
+        turno = Turno(
+            tipo_turno="TURNO_3",
+            abierto_por=self.barra_user,
+            importe_inicial_caja=Decimal("0.00"),
+            clave_idempotencia=uuid4(),
+        )
+
+        with self.assertRaises(ValidationError) as contexto:
+            turno.full_clean()
+        self.assertIn("tipo_turno", contexto.exception.message_dict)
+
+    def test_base_rechaza_caja_inicial_negativa(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(importe="-0.01")
+        self.assertFalse(Turno.objects.exists())
+
+    def test_base_rechaza_tipo_invalido(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(tipo="TURNO_3")
+        self.assertFalse(Turno.objects.exists())
+
+    def test_base_rechaza_estado_invalido(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(estado="PAUSADO")
+        self.assertFalse(Turno.objects.exists())
+
+    def test_base_rechaza_dos_turnos_abiertos_del_mismo_tipo(self):
+        self.crear_turno(Turno.Tipo.TURNO_1)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(Turno.Tipo.TURNO_1)
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_base_rechaza_turno_1_y_turno_2_abiertos_a_la_vez(self):
+        self.crear_turno(Turno.Tipo.TURNO_1)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(Turno.Tipo.TURNO_2)
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_permite_abrir_nuevo_turno_tras_cerrar_el_anterior(self):
+        primero = self.crear_turno(Turno.Tipo.TURNO_1)
+        self.cerrar(primero)
+
+        segundo = self.crear_turno(Turno.Tipo.TURNO_2, "500.00")
+
+        self.assertEqual(Turno.objects.count(), 2)
+        self.assertEqual(
+            list(Turno.objects.filter(estado=Turno.Estado.ABIERTO)),
+            [segundo],
+        )
+
+    def test_permite_varios_turnos_cerrados_del_mismo_tipo(self):
+        for _ in range(3):
+            self.cerrar(self.crear_turno(Turno.Tipo.TURNO_2))
+
+        self.assertEqual(
+            Turno.objects.filter(estado=Turno.Estado.CERRADO).count(),
+            3,
+        )
+
+    def test_cada_apertura_es_una_instancia_historica_distinta(self):
+        primero = self.crear_turno(Turno.Tipo.TURNO_1)
+        self.cerrar(primero)
+        segundo = self.crear_turno(Turno.Tipo.TURNO_1)
+
+        self.assertNotEqual(primero.pk, segundo.pk)
+        self.assertNotEqual(primero.clave_idempotencia, segundo.clave_idempotencia)
+
+    def test_base_rechaza_clave_idempotencia_repetida(self):
+        clave = uuid4()
+        turno = self.crear_turno()
+        self.cerrar(turno)
+        Turno.objects.filter(pk=turno.pk).update(clave_idempotencia=clave)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(clave_idempotencia=clave)
+
+    def test_base_rechaza_turno_abierto_con_datos_de_cierre(self):
+        cierre = timezone.now() + timedelta(hours=1)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(
+                fecha_cierre=cierre,
+                cerrado_por=self.barra_user,
+            )
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(fecha_cierre=cierre)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(cerrado_por=self.barra_user)
+
+    def test_base_rechaza_turno_cerrado_sin_datos_completos_de_cierre(self):
+        for extra in [
+            {},
+            {"fecha_cierre": timezone.now() + timedelta(hours=1)},
+            {"cerrado_por": self.barra_user},
+        ]:
+            with self.subTest(extra=extra):
+                with self.assertRaises(IntegrityError), transaction.atomic():
+                    self.crear_turno(estado=Turno.Estado.CERRADO, **extra)
+
+    def test_turno_abierto_con_fecha_cierre_nula_es_valido(self):
+        turno = self.crear_turno()
+
+        turno.full_clean()
+        turno.refresh_from_db()
+        self.assertIsNone(turno.fecha_cierre)
+
+    def test_base_rechaza_cierre_anterior_a_la_apertura(self):
+        apertura = timezone.now()
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.crear_turno(
+                estado=Turno.Estado.CERRADO,
+                fecha_apertura=apertura,
+                fecha_cierre=apertura - timedelta(seconds=1),
+                cerrado_por=self.barra_user,
+            )
+        self.assertFalse(Turno.objects.exists())
+
+    def test_turno_cerrado_con_cierre_posterior_a_la_apertura_es_valido(self):
+        apertura = timezone.now()
+        turno = self.crear_turno(
+            estado=Turno.Estado.CERRADO,
+            fecha_apertura=apertura,
+            fecha_cierre=apertura + timedelta(hours=8),
+            cerrado_por=self.barra_user,
+        )
+
+        turno.full_clean()
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_turno_cerrado_con_cierre_igual_a_la_apertura_es_valido(self):
+        apertura = timezone.now()
+        self.crear_turno(
+            estado=Turno.Estado.CERRADO,
+            fecha_apertura=apertura,
+            fecha_cierre=apertura,
+            cerrado_por=self.barra_user,
+        )
+
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_turno_cerrado_con_datos_de_cierre_es_valido(self):
+        turno = self.crear_turno(
+            estado=Turno.Estado.CERRADO,
+            fecha_cierre=timezone.now() + timedelta(hours=1),
+            cerrado_por=self.barra_user,
+        )
+
+        turno.full_clean()
+
+    def test_base_rechaza_reabrir_turno_si_ya_hay_otro_abierto(self):
+        cerrado = self.crear_turno(Turno.Tipo.TURNO_1)
+        self.cerrar(cerrado)
+        self.crear_turno(Turno.Tipo.TURNO_2)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Turno.objects.filter(pk=cerrado.pk).update(
+                estado=Turno.Estado.ABIERTO,
+                fecha_cierre=None,
+                cerrado_por=None,
+            )
+
+    def test_turno_puede_cruzar_medianoche_sin_dividirse(self):
+        inicio = timezone.now().replace(hour=20, minute=0, second=0, microsecond=0)
+        turno = self.crear_turno(Turno.Tipo.TURNO_2, fecha_apertura=inicio)
+        turno.estado = Turno.Estado.CERRADO
+        turno.fecha_cierre = inicio + timedelta(hours=8)
+        turno.cerrado_por = self.barra_user
+        turno.save()
+
+        turno.refresh_from_db()
+        self.assertEqual(Turno.objects.count(), 1)
+        self.assertEqual(
+            turno.fecha_cierre - turno.fecha_apertura,
+            timedelta(hours=8),
+        )
+
+
+class CobroCuentaTurnoTests(TestCase):
+    def setUp(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        self.mozo = User.objects.create_user(
+            username="cobro_turno_mozo",
+            password="x",
+            rol=User.Rol.MOZO,
+            sector=salon,
+        )
+        self.barra_user = User.objects.create_user(
+            username="cobro_turno_barra",
+            password="x",
+            rol=User.Rol.BARRA,
+            sector=barra,
+        )
+        self.mesa = Mesa.objects.create(numero=140)
+
+    def crear_cobro(self, turno=None, numero=0):
+        mesa = Mesa.objects.create(numero=150 + numero)
+        cuenta = Cuenta.objects.create(
+            mesa=mesa,
+            mozo_responsable=self.mozo,
+            estado=Cuenta.Estado.CERRADA,
+        )
+        return CobroCuenta.objects.create(
+            cuenta=cuenta,
+            mozo=self.mozo,
+            turno=turno,
+            total_cobrado=Decimal("0.00"),
+            total_esperado=Decimal("0.00"),
+            clave_idempotencia=uuid4(),
+        )
+
+    def test_cobro_historico_se_conserva_con_turno_nulo(self):
+        cobro = self.crear_cobro()
+
+        cobro.refresh_from_db()
+        self.assertIsNone(cobro.turno)
+        cobro.full_clean(exclude=["cuenta"])
+
+    def test_cobro_puede_asociarse_a_un_turno(self):
+        turno = Turno.objects.create(
+            tipo_turno=Turno.Tipo.TURNO_2,
+            abierto_por=self.barra_user,
+            importe_inicial_caja=Decimal("0.00"),
+            clave_idempotencia=uuid4(),
+        )
+        cobro = self.crear_cobro(turno)
+
+        self.assertEqual(list(turno.cobros.all()), [cobro])
+
+    def test_no_se_puede_eliminar_un_turno_con_cobros(self):
+        turno = Turno.objects.create(
+            tipo_turno=Turno.Tipo.TURNO_1,
+            abierto_por=self.barra_user,
+            importe_inicial_caja=Decimal("0.00"),
+            clave_idempotencia=uuid4(),
+        )
+        self.crear_cobro(turno)
+
+        with self.assertRaises(ProtectedError):
+            turno.delete()
+
+
+class TurnoEndpointsMixin:
+    def crear_usuarios(self):
+        salon = Sector.objects.create(nombre=Sector.Nombre.SALON)
+        barra = Sector.objects.create(nombre=Sector.Nombre.BARRA)
+        pizza = Sector.objects.create(nombre=Sector.Nombre.PIZZA)
+        self.barra = User.objects.create_user(
+            username="t_barra", password="x",
+            rol=User.Rol.BARRA, sector=barra,
+        )
+        self.otra_barra = User.objects.create_user(
+            username="t_otra_barra", password="x",
+            rol=User.Rol.BARRA, sector=barra,
+        )
+        self.barra_sector_incorrecto = User.objects.create_user(
+            username="t_barra_mal", password="x",
+            rol=User.Rol.BARRA, sector=salon,
+        )
+        self.mozo = User.objects.create_user(
+            username="t_mozo", password="x",
+            rol=User.Rol.MOZO, sector=salon,
+        )
+        self.cocina = User.objects.create_user(
+            username="t_cocina", password="x",
+            rol=User.Rol.COCINA, sector=pizza,
+        )
+        self.admin = User.objects.create_user(
+            username="t_admin", password="x", rol=User.Rol.ADMINISTRADOR,
+        )
+
+    def payload(self, **cambios):
+        datos = {
+            "tipo_turno": "TURNO_1",
+            "importe_inicial_caja": "1500.00",
+            "clave_idempotencia": str(uuid4()),
+        }
+        datos.update(cambios)
+        return datos
+
+
+class AbrirTurnoAPITests(TurnoEndpointsMixin, APITestCase):
+    def setUp(self):
+        self.crear_usuarios()
+        self.url = reverse("turno-abrir")
+
+    def abrir(self, usuario=None, **cambios):
+        if usuario is not False:
+            self.client.force_authenticate(user=usuario or self.barra)
+        return self.client.post(self.url, self.payload(**cambios), format="json")
+
+    def test_barra_abre_turno_1(self):
+        response = self.abrir(tipo_turno="TURNO_1")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["tipo_turno"], "TURNO_1")
+        self.assertEqual(response.data["estado"], "ABIERTO")
+        self.assertEqual(response.data["importe_inicial_caja"], "1500.00")
+        self.assertEqual(response.data["abierto_por_id"], self.barra.pk)
+        self.assertIsNone(response.data["fecha_cierre"])
+        turno = Turno.objects.get()
+        self.assertEqual(turno.abierto_por, self.barra)
+        self.assertEqual(turno.estado, Turno.Estado.ABIERTO)
+
+    def test_barra_abre_turno_2(self):
+        response = self.abrir(tipo_turno="TURNO_2")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Turno.objects.get().tipo_turno, Turno.Tipo.TURNO_2)
+
+    def test_apertura_con_importe_cero(self):
+        response = self.abrir(importe_inicial_caja="0")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            Turno.objects.get().importe_inicial_caja,
+            Decimal("0.00"),
+        )
+
+    def test_fecha_apertura_la_define_el_servidor(self):
+        antes = timezone.now()
+        self.abrir()
+
+        self.assertGreaterEqual(Turno.objects.get().fecha_apertura, antes)
+
+    def test_rechaza_datos_invalidos_sin_crear_turnos(self):
+        casos = [
+            {"importe_inicial_caja": "-0.01"},
+            {"importe_inicial_caja": "abc"},
+            {"importe_inicial_caja": "NaN"},
+            {"importe_inicial_caja": "1.234"},
+            {"importe_inicial_caja": None},
+            {"tipo_turno": "TURNO_3"},
+            {"tipo_turno": ""},
+            {"clave_idempotencia": "no-es-uuid"},
+        ]
+        for cambios in casos:
+            with self.subTest(cambios=cambios):
+                response = self.abrir(**cambios)
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        for campo in ["tipo_turno", "importe_inicial_caja", "clave_idempotencia"]:
+            with self.subTest(faltante=campo):
+                datos = self.payload()
+                datos.pop(campo)
+                response = self.client.post(self.url, datos, format="json")
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Turno.objects.exists())
+
+    def test_rechaza_campos_controlados_por_el_servidor(self):
+        for campo, valor in [
+            ("estado", "CERRADO"),
+            ("fecha_apertura", "2020-01-01T00:00:00Z"),
+            ("fecha_cierre", "2020-01-01T00:00:00Z"),
+            ("abierto_por", self.admin.pk),
+            ("cerrado_por", self.admin.pk),
+        ]:
+            with self.subTest(campo=campo):
+                response = self.abrir(**{campo: valor})
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(campo, response.data)
+        self.assertFalse(Turno.objects.exists())
+
+    def test_rechaza_usuario_no_autenticado(self):
+        self.client.force_authenticate(user=None)
+        response = self.abrir(usuario=False)
+
+        self.assertIn(
+            response.status_code,
+            {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN},
+        )
+        self.assertFalse(Turno.objects.exists())
+
+    def test_rechaza_roles_no_autorizados(self):
+        for usuario in [
+            self.mozo,
+            self.cocina,
+            self.admin,
+            self.barra_sector_incorrecto,
+        ]:
+            with self.subTest(usuario=usuario.username):
+                response = self.abrir(usuario=usuario)
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Turno.objects.exists())
+
+    def test_segunda_apertura_con_turno_abierto_devuelve_409(self):
+        self.abrir(tipo_turno="TURNO_1")
+
+        for tipo in ["TURNO_1", "TURNO_2"]:
+            with self.subTest(tipo=tipo):
+                response = self.abrir(tipo_turno=tipo)
+                self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+                self.assertIn("turno abierto", str(response.data["detail"]))
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_reintento_idempotente_devuelve_el_original(self):
+        clave = str(uuid4())
+        primero = self.abrir(clave_idempotencia=clave)
+        segundo = self.abrir(clave_idempotencia=clave)
+
+        self.assertEqual(primero.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(segundo.status_code, status.HTTP_200_OK)
+        self.assertEqual(segundo.data, primero.data)
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_clave_reutilizada_con_datos_distintos_devuelve_409(self):
+        clave = str(uuid4())
+        self.abrir(clave_idempotencia=clave)
+
+        for cambios in [
+            {"tipo_turno": "TURNO_2"},
+            {"importe_inicial_caja": "1.00"},
+        ]:
+            with self.subTest(cambios=cambios):
+                response = self.abrir(clave_idempotencia=clave, **cambios)
+                self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_clave_de_otro_usuario_devuelve_409(self):
+        clave = str(uuid4())
+        self.abrir(clave_idempotencia=clave)
+
+        response = self.abrir(usuario=self.otra_barra, clave_idempotencia=clave)
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Turno.objects.count(), 1)
+        self.assertEqual(Turno.objects.get().abierto_por, self.barra)
+
+    def test_reintento_con_turno_original_cerrado_devuelve_el_original(self):
+        clave = str(uuid4())
+        primero = self.abrir(clave_idempotencia=clave)
+        Turno.objects.update(
+            estado=Turno.Estado.CERRADO,
+            fecha_cierre=timezone.now() + timedelta(hours=1),
+            cerrado_por=self.barra,
+        )
+
+        segundo = self.abrir(clave_idempotencia=clave)
+
+        self.assertEqual(segundo.status_code, status.HTTP_200_OK)
+        self.assertEqual(segundo.data["id"], primero.data["id"])
+        self.assertEqual(segundo.data["estado"], "CERRADO")
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_clave_usada_no_crea_otro_turno_aunque_el_original_este_cerrado(self):
+        clave = str(uuid4())
+        self.abrir(clave_idempotencia=clave)
+        Turno.objects.update(
+            estado=Turno.Estado.CERRADO,
+            fecha_cierre=timezone.now() + timedelta(hours=1),
+            cerrado_por=self.barra,
+        )
+
+        response = self.abrir(clave_idempotencia=clave, tipo_turno="TURNO_2")
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Turno.objects.count(), 1)
+
+    def test_permite_abrir_nuevo_turno_con_clave_nueva_tras_cerrar(self):
+        self.abrir()
+        Turno.objects.update(
+            estado=Turno.Estado.CERRADO,
+            fecha_cierre=timezone.now() + timedelta(hours=1),
+            cerrado_por=self.barra,
+        )
+
+        response = self.abrir(tipo_turno="TURNO_2")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Turno.objects.count(), 2)
+
+    def test_conflicto_no_deja_la_conexion_en_transaccion_rota(self):
+        self.abrir()
+        self.abrir(tipo_turno="TURNO_2")
+
+        response = self.client.get(reverse("turno-actual"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["abierto"])
+
+    def test_choque_con_el_indice_unico_se_convierte_en_409(self):
+        # Simula la carrera: la consulta previa no ve el turno abierto, pero
+        # el índice único de PostgreSQL lo rechaza al insertar.
+        self.abrir()
+        with patch(
+            "django.db.models.query.QuerySet.exists",
+            side_effect=[False, True],
+        ):
+            response = self.abrir(tipo_turno="TURNO_2")
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Turno.objects.count(), 1)
+
+
+class TurnoActualAPITests(TurnoEndpointsMixin, APITestCase):
+    def setUp(self):
+        self.crear_usuarios()
+        self.url = reverse("turno-actual")
+
+    def abrir_turno(self):
+        return Turno.objects.create(
+            tipo_turno=Turno.Tipo.TURNO_2,
+            abierto_por=self.barra,
+            importe_inicial_caja=Decimal("2500.00"),
+            clave_idempotencia=uuid4(),
+        )
+
+    def test_sin_turno_abierto_responde_200_estable(self):
+        for usuario in [self.mozo, self.barra, self.admin]:
+            with self.subTest(usuario=usuario.username):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.get(self.url)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(
+                    response.data,
+                    {"abierto": False, "turno": None},
+                )
+
+    def test_turno_cerrado_no_cuenta_como_abierto(self):
+        turno = self.abrir_turno()
+        Turno.objects.filter(pk=turno.pk).update(
+            estado=Turno.Estado.CERRADO,
+            fecha_cierre=timezone.now() + timedelta(hours=1),
+            cerrado_por=self.barra,
+        )
+        self.client.force_authenticate(user=self.barra)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.data, {"abierto": False, "turno": None})
+
+    def test_barra_y_administrador_ven_toda_la_informacion(self):
+        turno = self.abrir_turno()
+        for usuario in [self.barra, self.admin]:
+            with self.subTest(usuario=usuario.username):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.get(self.url)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertTrue(response.data["abierto"])
+                datos = response.data["turno"]
+                self.assertEqual(datos["id"], turno.pk)
+                self.assertEqual(datos["tipo_turno"], "TURNO_2")
+                self.assertEqual(datos["estado"], "ABIERTO")
+                self.assertEqual(datos["importe_inicial_caja"], "2500.00")
+                self.assertEqual(datos["abierto_por_id"], self.barra.pk)
+                self.assertIn("fecha_apertura", datos)
+
+    def test_mozo_no_ve_el_importe_inicial(self):
+        turno = self.abrir_turno()
+        self.client.force_authenticate(user=self.mozo)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        datos = response.data["turno"]
+        self.assertEqual(
+            set(datos),
+            {"id", "tipo_turno", "tipo_turno_display", "estado", "fecha_apertura"},
+        )
+        self.assertEqual(datos["id"], turno.pk)
+        self.assertNotIn("2500", str(response.content))
+
+    def test_rechaza_cocina_barra_de_otro_sector_y_anonimo(self):
+        self.abrir_turno()
+        for usuario in [self.cocina, self.barra_sector_incorrecto]:
+            with self.subTest(usuario=usuario.username):
+                self.client.force_authenticate(user=usuario)
+                response = self.client.get(self.url)
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(user=None)
+        response = self.client.get(self.url)
+        self.assertIn(
+            response.status_code,
+            {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN},
+        )
+
+    def test_get_no_permite_escritura(self):
+        self.client.force_authenticate(user=self.barra)
+
+        response = self.client.post(self.url, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class AbrirTurnoConcurrenteTests(TurnoEndpointsMixin, TransactionTestCase):
+    def ejecutar_en_paralelo(self, solicitudes):
+        barrier = Barrier(len(solicitudes))
+        resultados = {}
+        errores = []
+
+        def enviar(nombre, usuario_id, datos):
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=User.objects.get(pk=usuario_id))
+                barrier.wait(timeout=5)
+                resultados[nombre] = client.post(
+                    reverse("turno-abrir"), datos, format="json",
+                )
+            except Exception as error:
+                errores.append(error)
+            finally:
+                close_old_connections()
+
+        hilos = [
+            Thread(target=enviar, args=(nombre, usuario_id, datos))
+            for nombre, (usuario_id, datos) in solicitudes.items()
+        ]
+        for hilo in hilos:
+            hilo.start()
+        for hilo in hilos:
+            hilo.join(timeout=15)
+        self.assertEqual(errores, [])
+        return resultados
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_aperturas_concurrentes_con_distinta_clave_crean_un_solo_turno(self):
+        self.crear_usuarios()
+        resultados = self.ejecutar_en_paralelo(
+            {
+                "uno": (self.barra.pk, self.payload(tipo_turno="TURNO_1")),
+                "dos": (self.otra_barra.pk, self.payload(tipo_turno="TURNO_2")),
+            }
+        )
+
+        codigos = sorted(r.status_code for r in resultados.values())
+        self.assertEqual(codigos, [status.HTTP_201_CREATED, status.HTTP_409_CONFLICT])
+        self.assertEqual(Turno.objects.count(), 1)
+        self.assertEqual(
+            Turno.objects.filter(estado=Turno.Estado.ABIERTO).count(),
+            1,
+        )
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_aperturas_concurrentes_con_la_misma_clave_no_duplican(self):
+        self.crear_usuarios()
+        datos = self.payload()
+        resultados = self.ejecutar_en_paralelo(
+            {
+                "uno": (self.barra.pk, datos),
+                "dos": (self.barra.pk, dict(datos)),
+            }
+        )
+
+        codigos = sorted(r.status_code for r in resultados.values())
+        self.assertEqual(codigos, [status.HTTP_200_OK, status.HTTP_201_CREATED])
+        self.assertEqual(Turno.objects.count(), 1)
+        ids = {r.data["id"] for r in resultados.values()}
+        self.assertEqual(len(ids), 1)

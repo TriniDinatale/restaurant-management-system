@@ -28,6 +28,7 @@ from .models import (
     Pedido,
     PreparacionPedidoSector,
     SolicitudCancelacionDetalle,
+    Turno,
 )
 from .serializers import (
     AvisoCargaBarraSerializer,
@@ -48,6 +49,9 @@ from .serializers import (
     SolicitudCancelacionPendienteSerializer,
     SolicitudCancelacionNotificacionSerializer,
     SolicitudCancelacionSerializer,
+    TurnoAperturaSerializer,
+    TurnoMozoSerializer,
+    TurnoSerializer,
 )
 from .services import (
     cantidad_disponible_cancelacion,
@@ -92,6 +96,31 @@ class IsCancellationReviewer(BasePermission):
         )
 
 
+class IsBarraSector(BasePermission):
+    message = "Solo un usuario de Barra del sector Barra puede realizar esta acción."
+
+    def has_permission(self, request, view):
+        user = request.user
+        return (
+            user.is_authenticated
+            and user.rol == User.Rol.BARRA
+            and user.sector_id is not None
+            and user.sector.nombre == Sector.Nombre.BARRA
+        )
+
+
+class CanViewTurno(BasePermission):
+    message = "No tenés permiso para consultar el turno."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user.is_authenticated:
+            return False
+        if user.rol in {User.Rol.MOZO, User.Rol.ADMINISTRADOR}:
+            return True
+        return IsBarraSector().has_permission(request, view)
+
+
 class IdempotencyKeyConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_detail = "La clave de idempotencia ya fue usada con otros datos."
@@ -101,6 +130,103 @@ class IdempotencyKeyConflict(APIException):
 class CuentaCobroConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_code = "cuenta_cobro_conflict"
+
+
+class TurnoAbiertoConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = (
+        "Ya hay un turno abierto. Debe cerrarse antes de abrir uno nuevo."
+    )
+    default_code = "turno_abierto_conflict"
+
+
+class AbrirTurnoView(generics.GenericAPIView):
+    """POST /api/pedidos/turnos/ — apertura manual del turno general."""
+
+    permission_classes = [IsBarraSector]
+    serializer_class = TurnoAperturaSerializer
+
+    def respuesta_existente(self, datos):
+        turno = (
+            Turno.objects.select_related("abierto_por", "cerrado_por")
+            .filter(clave_idempotencia=datos["clave_idempotencia"])
+            .first()
+        )
+        if turno is None:
+            return None
+        if (
+            turno.abierto_por_id != self.request.user.pk
+            or turno.tipo_turno != datos["tipo_turno"]
+            or turno.importe_inicial_caja != datos["importe_inicial_caja"]
+        ):
+            raise IdempotencyKeyConflict()
+        return Response(TurnoSerializer(turno).data, status=status.HTTP_200_OK)
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        datos = serializer.validated_data
+
+        existente = self.respuesta_existente(datos)
+        if existente is not None:
+            return existente
+
+        # La consulta previa solo da un mensaje claro; la garantía real es el
+        # índice único parcial unique_turno_abierto.
+        try:
+            with transaction.atomic():
+                if Turno.objects.filter(estado=Turno.Estado.ABIERTO).exists():
+                    raise TurnoAbiertoConflict()
+                turno = Turno.objects.create(
+                    tipo_turno=datos["tipo_turno"],
+                    importe_inicial_caja=datos["importe_inicial_caja"],
+                    clave_idempotencia=datos["clave_idempotencia"],
+                    abierto_por=request.user,
+                )
+        except IntegrityError:
+            existente = self.respuesta_existente(datos)
+            if existente is not None:
+                return existente
+            if Turno.objects.filter(estado=Turno.Estado.ABIERTO).exists():
+                raise TurnoAbiertoConflict()
+            raise
+
+        turno = Turno.objects.select_related("abierto_por", "cerrado_por").get(
+            pk=turno.pk,
+        )
+        return Response(
+            TurnoSerializer(turno).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class TurnoActualView(generics.GenericAPIView):
+    """GET /api/pedidos/turnos/actual/
+
+    Siempre responde 200. Sin turno abierto: {"abierto": false, "turno": null}.
+    Con turno abierto: {"abierto": true, "turno": {...}}. MOZO no recibe el
+    importe inicial de caja.
+    """
+
+    permission_classes = [CanViewTurno]
+    serializer_class = TurnoSerializer
+
+    def get(self, request, *args, **kwargs):
+        turno = (
+            Turno.objects.select_related("abierto_por", "cerrado_por")
+            .filter(estado=Turno.Estado.ABIERTO)
+            .first()
+        )
+        if turno is None:
+            return Response({"abierto": False, "turno": None})
+        serializer_class = (
+            TurnoMozoSerializer
+            if request.user.rol == User.Rol.MOZO
+            else TurnoSerializer
+        )
+        return Response(
+            {"abierto": True, "turno": serializer_class(turno).data},
+        )
 
 
 class PedidoCreateView(generics.CreateAPIView):
@@ -287,9 +413,23 @@ class CobrarCuentaView(generics.GenericAPIView):
                         }
                     )
 
+                # Orden de bloqueos: Mesa -> Cuenta -> Turno. El cierre general
+                # deberá respetarlo (y bloquear sus cuentas/mesas antes que el turno).
+                turno = (
+                    Turno.objects.select_for_update()
+                    .filter(estado=Turno.Estado.ABIERTO)
+                    .first()
+                )
+                if turno is None:
+                    raise CuentaCobroConflict(
+                        "No hay un turno abierto. Solicitá a Barra que abra "
+                        "el turno antes de cobrar."
+                    )
+
                 cobro = CobroCuenta.objects.create(
                     cuenta=cuenta,
                     mozo=request.user,
+                    turno=turno,
                     total_cobrado=total_actual,
                     total_esperado=datos["total_esperado"],
                     clave_idempotencia=datos["clave_idempotencia"],
@@ -412,12 +552,12 @@ class SolicitudCancelacionCreateView(generics.GenericAPIView):
             if existente is not None:
                 return existente
 
-            if estado_entrega(detalle) == "ENTREGADO":
+            if estado_entrega(detalle) == "RETIRO_HABILITADO":
                 raise serializers.ValidationError(
                     {
                         "detail": (
                             "No se pueden solicitar cancelaciones de "
-                            "productos entregados."
+                            "productos con retiro habilitado."
                         )
                     }
                 )

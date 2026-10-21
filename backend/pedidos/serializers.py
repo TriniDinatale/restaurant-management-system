@@ -18,6 +18,7 @@ from .models import (
     Pedido,
     PreparacionPedidoSector,
     SolicitudCancelacionDetalle,
+    Turno,
 )
 from .services import (
     cantidad_vigente,
@@ -649,11 +650,71 @@ class CobroCuentaSerializer(serializers.ModelSerializer):
             "id",
             "cuenta",
             "mozo",
+            "turno",
             "fecha_cobro",
             "total_cobrado",
             "importes",
         ]
         read_only_fields = fields
+
+
+class TurnoAperturaSerializer(serializers.Serializer):
+    tipo_turno = serializers.ChoiceField(choices=Turno.Tipo.choices)
+    importe_inicial_caja = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0.00"),
+    )
+    clave_idempotencia = serializers.UUIDField()
+
+    def validate(self, attrs):
+        extras = set(self.initial_data) - set(self.fields)
+        if extras:
+            raise serializers.ValidationError(
+                {
+                    campo: "Este campo no puede ser enviado por el cliente."
+                    for campo in sorted(extras)
+                }
+            )
+        return attrs
+
+
+class TurnoMozoSerializer(serializers.ModelSerializer):
+    tipo_turno_display = serializers.CharField(
+        source="get_tipo_turno_display",
+        read_only=True,
+    )
+
+    class Meta:
+        model = Turno
+        fields = [
+            "id",
+            "tipo_turno",
+            "tipo_turno_display",
+            "estado",
+            "fecha_apertura",
+        ]
+        read_only_fields = fields
+
+
+class TurnoSerializer(TurnoMozoSerializer):
+    abierto_por_id = serializers.IntegerField(read_only=True)
+    abierto_por_nombre = serializers.SerializerMethodField()
+    cerrado_por_id = serializers.IntegerField(read_only=True)
+
+    class Meta(TurnoMozoSerializer.Meta):
+        fields = TurnoMozoSerializer.Meta.fields + [
+            "importe_inicial_caja",
+            "abierto_por_id",
+            "abierto_por_nombre",
+            "fecha_cierre",
+            "cerrado_por_id",
+        ]
+        read_only_fields = fields
+
+    def get_abierto_por_nombre(self, turno):
+        usuario = turno.abierto_por
+        return usuario.get_full_name().strip() or usuario.username
 
 
 class MesaSerializer(serializers.ModelSerializer):

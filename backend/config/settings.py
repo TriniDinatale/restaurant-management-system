@@ -131,7 +131,7 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 # Subir este valor al modificar app.css / app.js para invalidar la caché de los celulares.
-STATIC_ASSET_VERSION = os.environ.get("STATIC_ASSET_VERSION", "2026.10.19-1")
+STATIC_ASSET_VERSION = os.environ.get("STATIC_ASSET_VERSION", "2026.10.21-1")
 
 AUTH_USER_MODEL = "usuarios.User"
 

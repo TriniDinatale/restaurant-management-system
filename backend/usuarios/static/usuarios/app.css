@@ -888,13 +888,18 @@ h2 {
     font-weight: 700;
 }
 
-.consumption-delivery-entregado {
+.consumption-delivery-retiro_habilitado {
     background: var(--accent);
     color: var(--primary-dark);
 }
 
 .consumption-delivery-cancelado {
     background: var(--line);
+}
+
+.consumption-delivery-desconocido {
+    background: var(--warning-bg);
+    color: var(--ink);
 }
 
 .consumption-subtotal {
@@ -1010,6 +1015,111 @@ h2 {
     display: grid;
     gap: 14px;
     margin-top: 32px;
+}
+
+.shift-panel {
+    display: grid;
+    gap: 14px;
+    margin-bottom: 8px;
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface);
+}
+
+.shift-panel .bar-retirements-heading .eyebrow {
+    margin-top: 0;
+}
+
+.shift-panel .message {
+    margin: 0;
+}
+
+.shift-badge {
+    padding: 5px 12px;
+    border: 1px solid var(--warning-border);
+    border-radius: 999px;
+    background: var(--warning-bg);
+    font-size: 0.82rem;
+    font-weight: 800;
+}
+
+.shift-badge.shift-badge-open {
+    border-color: var(--primary);
+    background: var(--accent);
+    color: var(--primary-dark);
+}
+
+.shift-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 14px;
+}
+
+.shift-form[hidden],
+.shift-details[hidden] {
+    display: none;
+}
+
+.shift-field {
+    display: grid;
+    gap: 6px;
+}
+
+.shift-field label {
+    font-weight: 700;
+}
+
+.shift-field input,
+.shift-field select {
+    width: 100%;
+    min-height: 46px;
+    padding: 10px 12px;
+    border: 1px solid #b9c9c0;
+    border-radius: 9px;
+    background: white;
+    color: var(--ink);
+    font: inherit;
+}
+
+.shift-field small {
+    color: var(--muted);
+}
+
+.shift-form .button {
+    align-self: start;
+    margin-top: 29px;
+}
+
+.shift-details {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+    gap: 14px;
+    margin: 0;
+}
+
+.shift-details dt {
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+.shift-details dd {
+    margin: 2px 0 0;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 700px) {
+    .shift-form {
+        grid-template-columns: 1fr;
+    }
+
+    .shift-form .button {
+        width: 100%;
+        margin-top: 0;
+    }
 }
 
 #bar-retirements[hidden] {

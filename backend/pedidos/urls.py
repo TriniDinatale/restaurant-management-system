@@ -2,6 +2,8 @@
 from django.urls import path
 
 from .views import (
+    AbrirTurnoView,
+    TurnoActualView,
     PedidoCreateView,
     PedidoPorMesaCreateView,
     CuentaListCreateView,
@@ -33,6 +35,8 @@ urlpatterns = [
     ),
     
     path("mesas/", MesaListView.as_view(), name="mesa-list"),
+    path("turnos/", AbrirTurnoView.as_view(), name="turno-abrir"),
+    path("turnos/actual/", TurnoActualView.as_view(), name="turno-actual"),
     path(
         "mesas/cargas/",
         PedidoPorMesaCreateView.as_view(),

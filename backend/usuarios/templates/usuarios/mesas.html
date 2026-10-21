@@ -20,6 +20,52 @@
     <div id="page-message" class="message" role="alert" aria-live="polite" hidden></div>
     <p id="loading-message" class="loading-message" role="status">Cargando mesas y cuentas…</p>
 
+    {% if puede_gestionar_turno %}
+    <section id="shift-panel" class="shift-panel" aria-labelledby="shift-title">
+        <div class="bar-retirements-heading">
+            <div>
+                <p class="eyebrow">TURNO</p>
+                <h2 id="shift-title">Turno general</h2>
+            </div>
+            <span id="shift-status" class="shift-badge" role="status">Cargando turno…</span>
+        </div>
+        <p id="shift-message" class="message" role="status" aria-live="polite" hidden></p>
+        <form id="shift-open-form" class="shift-form" novalidate hidden>
+            <div class="shift-field">
+                <label for="shift-type">Turno</label>
+                <select id="shift-type" name="tipo_turno" required>
+                    <option value="">Elegí el turno</option>
+                    <option value="TURNO_1">Turno 1 — Mañana</option>
+                    <option value="TURNO_2">Turno 2 — Tarde/Noche</option>
+                </select>
+            </div>
+            <div class="shift-field">
+                <label for="shift-amount">Importe inicial de caja</label>
+                <input
+                    id="shift-amount"
+                    name="importe_inicial_caja"
+                    type="text"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    placeholder="0,00"
+                    aria-describedby="shift-amount-help"
+                    required
+                >
+                <small id="shift-amount-help">Ingresá 0 si la caja comienza vacía.</small>
+            </div>
+            <button id="shift-open-button" class="button button-primary" type="submit">
+                Abrir turno
+            </button>
+        </form>
+        <dl id="shift-current" class="shift-details" hidden>
+            <div><dt>Turno</dt><dd id="shift-current-type"></dd></div>
+            <div><dt>Estado</dt><dd id="shift-current-state"></dd></div>
+            <div><dt>Apertura</dt><dd id="shift-current-opened-at"></dd></div>
+            <div><dt>Abierto por</dt><dd id="shift-current-opened-by"></dd></div>
+            <div><dt>Caja inicial</dt><dd id="shift-current-amount"></dd></div>
+        </dl>
+    </section>
+    {% endif %}
     <section
         id="bar-preparations"
         class="bar-retirements"

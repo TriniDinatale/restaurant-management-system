@@ -16,6 +16,8 @@ const API = {
     productos: "/api/productos/",
     pedidosPorMesa: "/api/pedidos/mesas/cargas/",
     cargasBarra: "/api/pedidos/barra/cargas/",
+    turnos: "/api/pedidos/turnos/",
+    turnoActual: "/api/pedidos/turnos/actual/",
     consumoCuenta: (cuentaId) => `/api/pedidos/cuentas/${cuentaId}/consumo/`,
     cobrarCuenta: (cuentaId) => `/api/pedidos/cuentas/${cuentaId}/cobrar/`,
     cancelacionesCuenta: (cuentaId, detalleId) =>
@@ -42,6 +44,36 @@ const ROLE_LABELS = {
     BARRA: "Barra",
     COCINA: "Cocina",
 };
+
+const DELIVERY_STATUS_LABELS = {
+    PENDIENTE: "Pendiente",
+    RETIRO_HABILITADO: "Retiro habilitado",
+    CANCELADO: "Cancelado",
+};
+
+function deliveryStatusDisplay(estado) {
+    if (Object.hasOwn(DELIVERY_STATUS_LABELS, estado)) {
+        return {
+            label: DELIVERY_STATUS_LABELS[estado],
+            className: `consumption-delivery-${estado.toLowerCase()}`,
+        };
+    }
+    return {
+        label: "Estado desconocido",
+        className: "consumption-delivery-desconocido",
+    };
+}
+
+const RESTAURANT_TIME_ZONE = "America/Argentina/Cordoba";
+
+const SHIFT_TYPE_LABELS = {
+    TURNO_1: "Turno 1 — Mañana",
+    TURNO_2: "Turno 2 — Tarde/Noche",
+};
+
+let shiftOpenOperation = null;
+let shiftOpenPending = false;
+let shiftMessageIsError = false;
 
 let csrfToken = "";
 let currentUser = null;
@@ -1201,17 +1233,11 @@ function renderAccountConsumption(consumption) {
                     "consumption-item-price",
                     `${formatMoney(detalle.precio_unitario)} c/u`,
                 ));
-                const deliveryLabels = {
-                    PENDIENTE: "Pendiente",
-                    ENTREGADO: "Entregado",
-                    CANCELADO: "Cancelado",
-                };
+                const deliveryState = deliveryStatusDisplay(detalle.estado_entrega);
                 productInfo.append(makeElement(
                     "span",
-                    `consumption-delivery-status consumption-delivery-${(
-                        detalle.estado_entrega || "PENDIENTE"
-                    ).toLowerCase()}`,
-                    deliveryLabels[detalle.estado_entrega] || "Pendiente",
+                    `consumption-delivery-status ${deliveryState.className}`,
+                    deliveryState.label,
                 ));
                 row.append(productInfo);
                 row.append(makeElement(
@@ -2965,6 +2991,9 @@ function refreshOperationalData(immediate = false, forceAccountId = null, succes
                 const page = document.body.dataset.page;
                 if (page === "mesas") {
                     tasks.push(loadTables(true));
+                    if (document.getElementById("shift-panel")) {
+                        tasks.push(loadShiftStatus(true));
+                    }
                     if (currentUser.rol === "BARRA") {
                         tasks.push(loadBarPreparations("", true));
                         tasks.push(loadBarRetirements("", true));
@@ -3092,6 +3121,169 @@ function closeNotificationPanel() {
     bell.setAttribute("aria-expanded", "false");
 }
 
+function formatRestaurantDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "Fecha no disponible";
+    const options = { dateStyle: "short", timeStyle: "short" };
+    try {
+        return new Intl.DateTimeFormat("es-AR", {
+            ...options,
+            timeZone: RESTAURANT_TIME_ZONE,
+        }).format(date);
+    } catch {
+        // Sin soporte de zonas IANA: Argentina usa UTC-3 fijo, sin horario de verano.
+        return new Intl.DateTimeFormat("es-AR", {
+            ...options,
+            timeZone: "UTC",
+        }).format(new Date(date.getTime() - 3 * 60 * 60 * 1000));
+    }
+}
+
+function setShiftMessage(text, isError = false) {
+    const message = document.getElementById("shift-message");
+    if (!message) return;
+    message.textContent = text;
+    message.classList.toggle("message-error", isError);
+    message.hidden = !text;
+    shiftMessageIsError = Boolean(text) && isError;
+}
+
+function renderShift(data) {
+    const turno = data && data.abierto ? data.turno : null;
+    const status = document.getElementById("shift-status");
+    status.textContent = turno ? "Turno abierto" : "Sin turno abierto";
+    status.classList.toggle("shift-badge-open", Boolean(turno));
+    document.getElementById("shift-open-form").hidden = Boolean(turno);
+    document.getElementById("shift-current").hidden = !turno;
+    if (!turno) return;
+    document.getElementById("shift-current-type").textContent =
+        turno.tipo_turno_display
+        || SHIFT_TYPE_LABELS[turno.tipo_turno]
+        || turno.tipo_turno;
+    document.getElementById("shift-current-state").textContent = "ABIERTO";
+    document.getElementById("shift-current-opened-at").textContent =
+        formatRestaurantDateTime(turno.fecha_apertura);
+    document.getElementById("shift-current-opened-by").textContent =
+        turno.abierto_por_nombre || "No disponible";
+    document.getElementById("shift-current-amount").textContent =
+        formatMoney(turno.importe_inicial_caja);
+}
+
+async function loadShiftStatus(silent = false) {
+    if (!document.getElementById("shift-panel")) return null;
+    try {
+        const data = await fetchApi(API.turnoActual);
+        renderShift(data);
+        if (shiftMessageIsError) setShiftMessage("");
+        return true;
+    } catch (error) {
+        if (error instanceof StaleApiReadError) return false;
+        const status = document.getElementById("shift-status");
+        if (!status.classList.contains("shift-badge-open")) {
+            status.textContent = "Turno no disponible";
+        }
+        if (!silent || !shiftMessageIsError) {
+            setShiftMessage(
+                error.message || "No se pudo consultar el turno.",
+                true,
+            );
+        }
+        return false;
+    }
+}
+
+function shiftOpenErrorMessage(error) {
+    if (error.status === undefined) {
+        return "No se pudo conectar con el servidor. Revisá la conexión y "
+            + "tocá Abrir turno de nuevo: se reutilizará la misma solicitud.";
+    }
+    if (error.status === 401 || error.status === 403) {
+        return "Tu sesión venció o no tenés permiso para abrir turnos.";
+    }
+    if (error.status === 409) {
+        return error.message || "Ya hay un turno abierto.";
+    }
+    if (error.status === 400) {
+        return `Los datos del turno no son válidos. ${error.message}`;
+    }
+    return "No se pudo abrir el turno. Intentá nuevamente.";
+}
+
+async function submitShiftOpen(event) {
+    event.preventDefault();
+    if (shiftOpenPending) return;
+    const form = event.currentTarget;
+    const button = document.getElementById("shift-open-button");
+    const tipo = form.elements.tipo_turno.value;
+    const cents = moneyToCents(form.elements.importe_inicial_caja.value);
+    if (!SHIFT_TYPE_LABELS[tipo]) {
+        setShiftMessage("Elegí el tipo de turno.", true);
+        form.elements.tipo_turno.focus();
+        return;
+    }
+    if (cents === null) {
+        setShiftMessage(
+            "Ingresá un importe inicial válido, por ejemplo 0 o 15000,50.",
+            true,
+        );
+        form.elements.importe_inicial_caja.focus();
+        return;
+    }
+    const importe = centsToMoney(cents);
+    const signature = `${tipo}|${importe}`;
+    if (!shiftOpenOperation || shiftOpenOperation.signature !== signature) {
+        try {
+            shiftOpenOperation = {
+                signature,
+                clave_idempotencia: generateIdempotencyKey(),
+            };
+        } catch (error) {
+            setShiftMessage(error.message, true);
+            return;
+        }
+    }
+
+    shiftOpenPending = true;
+    button.disabled = true;
+    button.textContent = "Abriendo turno…";
+    setShiftMessage("");
+    try {
+        const turno = await fetchApi(API.turnos, {
+            method: "POST",
+            body: JSON.stringify({
+                tipo_turno: tipo,
+                importe_inicial_caja: importe,
+                clave_idempotencia: shiftOpenOperation.clave_idempotencia,
+            }),
+        });
+        shiftOpenOperation = null;
+        form.reset();
+        if (turno.estado === "ABIERTO") {
+            renderShift({ abierto: true, turno });
+            setShiftMessage("Turno abierto correctamente.");
+        } else {
+            setShiftMessage("Esta apertura ya estaba registrada y el turno fue cerrado.");
+        }
+        await loadShiftStatus(true);
+    } catch (error) {
+        // Sin respuesta del servidor se conserva la clave para reintentar la misma operación.
+        if (error.status !== undefined) shiftOpenOperation = null;
+        if (error.status === 409) await loadShiftStatus(true);
+        setShiftMessage(shiftOpenErrorMessage(error), true);
+    } finally {
+        shiftOpenPending = false;
+        button.disabled = false;
+        button.textContent = "Abrir turno";
+    }
+}
+
+function initializeShiftPanel() {
+    const form = document.getElementById("shift-open-form");
+    if (!form) return;
+    form.addEventListener("submit", submitShiftOpen);
+    loadShiftStatus();
+}
+
 function initializeLogin() {
     const form = document.getElementById("login-form");
     form.addEventListener("submit", submitLogin);
@@ -3131,6 +3323,7 @@ async function initializeOperationalPage() {
             );
         }
         initializeOrderForm();
+        initializeShiftPanel();
 
         await loadTables();
         if (user.rol === "BARRA") {

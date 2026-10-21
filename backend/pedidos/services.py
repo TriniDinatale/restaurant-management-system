@@ -57,9 +57,10 @@ def total_vigente_cuenta(cuenta):
 def productos_pendientes_para_cierre(cuenta):
     """Describe los productos vigentes que impiden cobrar y cerrar la cuenta.
 
-    Un producto vigente está listo para el cierre cuando la preparación de su
-    sector en ese pedido está LISTO y existe el aviso de retiro de su origen
-    (barra lo habilita al marcar listo; cocina lo habilita Barra manualmente).
+    Un producto vigente de BARRA está listo para el cierre cuando su preparación
+    está LISTO y existe el aviso de retiro de BARRA. Los productos de PIZZA y
+    PLATOS no pasan por una pantalla de cocina: les basta el aviso de retiro de
+    COCINA, que Barra confirma manualmente al verificarlos físicamente.
     """
     estados_preparacion = {
         (prep.pedido_id, prep.sector_id): prep.estado
@@ -85,20 +86,29 @@ def productos_pendientes_para_cierre(cuenta):
         cantidad = cantidad_vigente(detalle)
         if cantidad <= 0:
             continue
-        estado = estados_preparacion.get(
-            (detalle.pedido_id, detalle.sector_destino_id),
-        )
         origen = origen_entrega(detalle)
-        if estado != PreparacionPedidoSector.Estado.LISTO:
-            motivo = (
-                "en preparación"
-                if estado == PreparacionPedidoSector.Estado.EN_PREPARACION
-                else "pendiente de preparación"
-            )
-        elif origen is None or (detalle.pedido_id, origen) not in retiros_habilitados:
-            motivo = "listo, sin retiro habilitado por Barra"
+        retiro_habilitado = (
+            origen is not None
+            and (detalle.pedido_id, origen) in retiros_habilitados
+        )
+        if origen == AvisoRetiro.Origen.COCINA:
+            if retiro_habilitado:
+                continue
+            motivo = "sin retiro habilitado por Barra"
         else:
-            continue
+            estado = estados_preparacion.get(
+                (detalle.pedido_id, detalle.sector_destino_id),
+            )
+            if estado != PreparacionPedidoSector.Estado.LISTO:
+                motivo = (
+                    "en preparación"
+                    if estado == PreparacionPedidoSector.Estado.EN_PREPARACION
+                    else "pendiente de preparación"
+                )
+            elif not retiro_habilitado:
+                motivo = "listo, sin retiro habilitado por Barra"
+            else:
+                continue
         pendientes.append(
             f"Pedido {detalle.pedido_id}: {cantidad} x "
             f"{detalle.producto.nombre} ({motivo})"
@@ -127,7 +137,7 @@ def estado_entrega(detalle):
 
     avisos = detalle.pedido.avisos_retiro.all()
     if any(aviso.origen == origen for aviso in avisos):
-        return "ENTREGADO"
+        return "RETIRO_HABILITADO"
     return "PENDIENTE"
 
 
@@ -135,13 +145,13 @@ def resumen_detalle_consumo(detalle):
     cantidades = cantidades_cancelacion(detalle)
     estado = estado_entrega(detalle)
     disponibles = cantidades["disponibles"]
-    if estado == "ENTREGADO":
+    if estado == "RETIRO_HABILITADO":
         disponibles = 0
     return {
         **cantidades,
         "estado_entrega": estado,
         "puede_solicitar_cancelacion": (
-            estado != "ENTREGADO" and disponibles > 0
+            estado != "RETIRO_HABILITADO" and disponibles > 0
         ),
         "cantidad_disponible_cancelacion": disponibles,
     }

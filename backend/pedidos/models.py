@@ -98,6 +98,91 @@ class Cuenta(models.Model):
         )
 
 
+class Turno(models.Model):
+    class Tipo(models.TextChoices):
+        TURNO_1 = "TURNO_1", "Turno 1 — Mañana"
+        TURNO_2 = "TURNO_2", "Turno 2 — Tarde/Noche"
+
+    class Estado(models.TextChoices):
+        ABIERTO = "ABIERTO", "Abierto"
+        CERRADO = "CERRADO", "Cerrado"
+
+    tipo_turno = models.CharField(max_length=10, choices=Tipo.choices)
+    estado = models.CharField(
+        max_length=10,
+        choices=Estado.choices,
+        default=Estado.ABIERTO,
+    )
+    fecha_apertura = models.DateTimeField(default=timezone.now)
+    abierto_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="turnos_abiertos",
+    )
+    importe_inicial_caja = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(0)],
+    )
+    fecha_cierre = models.DateTimeField(null=True, blank=True)
+    cerrado_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="turnos_cerrados",
+    )
+    clave_idempotencia = models.UUIDField(unique=True, editable=False)
+
+    class Meta:
+        ordering = ["-fecha_apertura", "-pk"]
+        constraints = [
+            # Índice sobre una constante: a lo sumo una fila ABIERTO en total.
+            models.UniqueConstraint(
+                models.Value(1),
+                condition=Q(estado="ABIERTO"),
+                name="unique_turno_abierto",
+            ),
+            models.CheckConstraint(
+                condition=Q(importe_inicial_caja__gte=0),
+                name="turno_importe_inicial_no_negativo",
+            ),
+            models.CheckConstraint(
+                condition=Q(tipo_turno__in=["TURNO_1", "TURNO_2"]),
+                name="turno_tipo_valido",
+            ),
+            models.CheckConstraint(
+                condition=Q(estado__in=["ABIERTO", "CERRADO"]),
+                name="turno_estado_valido",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        estado="ABIERTO",
+                        fecha_cierre__isnull=True,
+                        cerrado_por__isnull=True,
+                    )
+                    | Q(
+                        estado="CERRADO",
+                        fecha_cierre__isnull=False,
+                        cerrado_por__isnull=False,
+                    )
+                ),
+                name="turno_estado_cierre_coherente",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(fecha_cierre__isnull=True)
+                    | Q(fecha_cierre__gte=models.F("fecha_apertura"))
+                ),
+                name="turno_cierre_no_anterior_apertura",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Turno {self.pk} - {self.get_tipo_turno_display()} - {self.estado}"
+
+
 class CobroCuenta(models.Model):
     class Medio(models.TextChoices):
         EFECTIVO = "EFECTIVO", "Efectivo"
@@ -113,6 +198,13 @@ class CobroCuenta(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="cobros_cuenta",
+    )
+    turno = models.ForeignKey(
+        Turno,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="cobros",
     )
     fecha_cobro = models.DateTimeField(auto_now_add=True)
     total_cobrado = models.DecimalField(max_digits=12, decimal_places=2)
